@@ -3,7 +3,7 @@ import { env } from "../config/env";
 
 export const pool = new Pool({
   connectionString: env.databaseUrl,
-  ssl: { rejectUnauthorized: false },
+  ssl: env.databaseUrl.includes("localhost") ? false : { rejectUnauthorized: false },
 });
 
 pool.on("error", (err) => {
