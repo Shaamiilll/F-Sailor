@@ -129,15 +129,39 @@ export async function findProductsByFactory(factoryId: string): Promise<Product[
   return result.rows.map(mapProduct);
 }
 
-export async function findProductById(
-  id: string,
-  factoryId: string
-): Promise<Product | null> {
-  const result = await pool.query(
-    "SELECT * FROM products WHERE id = $1 AND factory_id = $2",
-    [id, factoryId]
-  );
-  return result.rows[0] ? mapProduct(result.rows[0]) : null;
+export async function findProductById(identifier: string, factoryId: string) {
+  const client = await pool.connect();
+  try {
+    // 1. If it's a real UUID, look up by exact ID
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(identifier.trim());
+
+    if (isUuid) {
+      const res = await client.query(
+        "SELECT * FROM products WHERE id = $1 AND factory_id = $2",
+        [identifier.trim(), factoryId]
+      );
+      if (res.rows.length > 0) return res.rows[0];
+    }
+
+    // 2. Normalize both database name and input to pure alphanumeric (letters & numbers only!)
+    // e.g. "double-wall-insulated-coffee-cup-12oz" -> "doublewallinsulatedcoffeecup12oz"
+    const cleanAlphanumeric = identifier.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+    const fallbackRes = await client.query(
+      `SELECT * FROM products 
+       WHERE factory_id = $1 
+         AND (
+           REGEXP_REPLACE(LOWER(name), '[^a-z0-9]', '', 'g') LIKE $2
+           OR REGEXP_REPLACE(LOWER(name), '[^a-z0-9]', '', 'g') LIKE $3
+         )
+       LIMIT 1`,
+      [factoryId, `%${cleanAlphanumeric}%`, `%${cleanAlphanumeric.substring(0, 10)}%`]
+    );
+
+    return fallbackRes.rows[0] || null;
+  } finally {
+    client.release();
+  }
 }
 
 export async function createProduct(

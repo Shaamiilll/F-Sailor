@@ -4,6 +4,7 @@ import { env } from "./config/env";
 import authRoutes from "./routes/auth.routes";
 import adminRoutes from "./routes/admin.routes";
 import productRoutes from "./routes/product.routes";
+import chatRoutes from "./routes/chat.routes";
 
 const app = express();
 
@@ -14,6 +15,8 @@ app.use(
   })
 );
 app.use(express.json());
+app.use("/api/chat", chatRoutes);
+app.use("/uploads", express.static("uploads"));
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });

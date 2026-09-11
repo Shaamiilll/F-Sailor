@@ -80,3 +80,83 @@ export interface CreateProductInput {
 }
 
 export interface UpdateProductInput extends Partial<CreateProductInput> {}
+// Add these to their existing src/types/index.ts (append at the end)
+
+export interface Lead {
+  id: string;
+  factoryId: string;
+  name: string | null;
+  email: string | null;
+  phone: string | null;
+  company: string | null;
+  country: string | null;
+  source: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface ChatSession {
+  id: string;
+  factoryId: string;
+  leadId: string | null;
+  externalUserId: string;
+  createdAt: Date;
+  lastActiveAt: Date;
+}
+
+export type ChatMessageRole = "user" | "bot";
+
+export interface ChatMessage {
+  id: string;
+  sessionId: string;
+  role: ChatMessageRole;
+  content: string;
+  createdAt: Date;
+}
+
+export interface DiscountTier {
+  id: string;
+  factoryId: string;
+  minQuantity: number;
+  discountPercent: number;
+}
+
+export type ShippingRateType = "flat" | "per_unit" | "per_kg";
+
+export interface ShippingRate {
+  id: string;
+  factoryId: string;
+  destinationCountry: string | null;
+  rateType: ShippingRateType;
+  rateValue: number;
+}
+
+export type QuotationStatus = "draft" | "sent" | "approved" | "rejected";
+
+export interface Quotation {
+  id: string;
+  factoryId: string;
+  leadId: string | null;
+  productId: string | null;
+  quantity: number;
+  unitPrice: number;
+  discountPercent: number;
+  discountAmount: number;
+  shippingCost: number;
+  subtotal: number;
+  totalPrice: number;
+  currency: string;
+  status: QuotationStatus;
+  pdfUrl: string | null;
+  createdAt: Date;
+}
+
+export interface Mockup {
+  id: string;
+  factoryId: string;
+  leadId: string | null;
+  productId: string;
+  logoUrl: string;
+  generatedImageUrl: string | null;
+  createdAt: Date;
+}
