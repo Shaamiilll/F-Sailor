@@ -7,6 +7,7 @@ import productRoutes from "./routes/product.routes";
 
 const app = express();
 
+console.log(env.frontendUrl); 
 app.use(
   cors({
     origin: env.frontendUrl,
