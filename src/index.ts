@@ -4,17 +4,24 @@ import { env } from "./config/env";
 import authRoutes from "./routes/auth.routes";
 import adminRoutes from "./routes/admin.routes";
 import productRoutes from "./routes/product.routes";
+import chatRoutes from "./routes/chat.routes";
+import quoteDashboardRoutes from "./routes/quote-dashboard.routes";
 
 const app = express();
 
-console.log(env.frontendUrl); 
+// NEW: Universal CORS + 25MB Photo Upload Support!
 app.use(
   cors({
-    origin: env.frontendUrl,
+    origin: true, // Allows Vercel, localhost:3000, and local preview tests without CORS blocks!
     credentials: true,
   })
 );
-app.use(express.json());
+
+// Allow photos up to 25MB (Prevents "Payload Too Large" errors!)
+app.use(express.json({ limit: "25mb" }));
+app.use(express.urlencoded({ limit: "25mb", extended: true }));
+app.use("/api/chat", chatRoutes);
+app.use("/uploads", express.static("uploads"));
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
@@ -23,7 +30,7 @@ app.get("/health", (_req, res) => {
 app.use("/api/auth", authRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/products", productRoutes);
-
+app.use("/api/quotations", quoteDashboardRoutes);
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found" });
 });
