@@ -45,6 +45,7 @@ export async function login(email: string, password: string) {
           country: factory.country,
           email: factory.email,
           phone: factory.phone,
+          username: factory.username,
         }
       : null,
   };
@@ -65,6 +66,7 @@ export async function getMe(userId: string) {
         country: f.country,
         email: f.email,
         phone: f.phone,
+        username: f.username,
       };
     }
   }

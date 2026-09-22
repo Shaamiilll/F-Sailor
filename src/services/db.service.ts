@@ -14,6 +14,7 @@ function mapFactory(row: Record<string, unknown>): any {
     email: row.email as string,
     phone: row.phone as string,
     logoUrl: row.logo_url as string | null,
+    username: row.username as string | null,
     // Automatically creates the unique, clickable Telegram Bot link for this factory!
     telegramBotUrl: `https://t.me/${BOT_USERNAME}?start=${factoryId}`,
     createdAt: row.created_at as Date,
@@ -73,6 +74,13 @@ export async function findAllFactories(): Promise<Factory[]> {
 
 export async function findFactoryById(id: string): Promise<Factory | null> {
   const result = await pool.query("SELECT * FROM factories WHERE id = $1", [id]);
+  return result.rows[0] ? mapFactory(result.rows[0]) : null;
+}
+
+export async function findFactoryByUsername(username: string): Promise<Factory | null> {
+  const result = await pool.query("SELECT * FROM factories WHERE username = $1", [
+    username.toLowerCase(),
+  ]);
   return result.rows[0] ? mapFactory(result.rows[0]) : null;
 }
 
@@ -153,7 +161,14 @@ export async function findProductById(identifier: string, factoryId: string): Pr
 }
 
 export async function createFactoryWithUser(
-  factory: { name: string; type: string; country: string; email: string; phone: string },
+  factory: {
+    name: string;
+    type: string;
+    country: string;
+    email: string;
+    phone: string;
+    username: string;
+  },
   passwordHash: string
 ): Promise<{ factory: Factory; user: User }> {
   const client = await pool.connect();
@@ -161,10 +176,17 @@ export async function createFactoryWithUser(
     await client.query("BEGIN");
 
     const factoryResult = await client.query(
-      `INSERT INTO factories (name, type, country, email, phone)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO factories (name, type, country, email, phone, username)
+       VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING *`,
-      [factory.name, factory.type, factory.country, factory.email.toLowerCase(), factory.phone]
+      [
+        factory.name,
+        factory.type,
+        factory.country,
+        factory.email.toLowerCase(),
+        factory.phone,
+        factory.username.toLowerCase(),
+      ]
     );
     const createdFactory = mapFactory(factoryResult.rows[0]);
 

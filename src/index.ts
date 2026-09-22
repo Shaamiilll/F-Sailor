@@ -6,6 +6,7 @@ import adminRoutes from "./routes/admin.routes";
 import productRoutes from "./routes/product.routes";
 import chatRoutes from "./routes/chat.routes";
 import quoteDashboardRoutes from "./routes/quote-dashboard.routes";
+import publicRoutes from "./routes/public.routes";
 
 const app = express();
 
@@ -31,6 +32,7 @@ app.use("/api/auth", authRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/products", productRoutes);
 app.use("/api/quotations", quoteDashboardRoutes);
+app.use("/api/public", publicRoutes);
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found" });
 });

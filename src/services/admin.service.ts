@@ -14,6 +14,7 @@ export async function listFactories() {
     country: f.country,
     email: f.email,
     phone: f.phone,
+    username: f.username,
     createdAt: f.createdAt,
   }));
 }
@@ -28,6 +29,7 @@ export async function createFactory(input: CreateFactoryInput) {
       country: input.country,
       email: input.email,
       phone: input.phone,
+      username: input.username,
     },
     passwordHash
   );
@@ -40,6 +42,7 @@ export async function createFactory(input: CreateFactoryInput) {
       country: factory.country,
       email: factory.email,
       phone: factory.phone,
+      username: factory.username,
     },
     loginEmail: user.email,
   };

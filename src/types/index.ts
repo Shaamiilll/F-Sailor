@@ -16,6 +16,7 @@ export interface Factory {
   country: string;
   email: string;
   phone: string;
+  username: string | null;
   createdAt: Date;
 }
 
@@ -58,6 +59,7 @@ export interface CreateFactoryInput {
   email: string;
   phone: string;
   password: string;
+  username: string;
 }
 
 export interface CreateProductInput {

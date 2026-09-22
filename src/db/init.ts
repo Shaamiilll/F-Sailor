@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS factories (
   country VARCHAR(255) NOT NULL DEFAULT '',
   email VARCHAR(255) NOT NULL UNIQUE,
   phone VARCHAR(50) NOT NULL DEFAULT '',
+  username VARCHAR(63) UNIQUE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -148,6 +149,10 @@ CREATE INDEX IF NOT EXISTS idx_mockups_product ON mockups(product_id);
 -- (the factory's logo). Neither existed in the original schema.
 ALTER TABLE products ADD COLUMN IF NOT EXISTS image_url VARCHAR(500);
 ALTER TABLE factories ADD COLUMN IF NOT EXISTS logo_url VARCHAR(500);
+
+-- Username doubles as the factory's subdomain (e.g. acme.factoryflow.com).
+-- Added after the original schema, so older rows may not have one yet.
+ALTER TABLE factories ADD COLUMN IF NOT EXISTS username VARCHAR(63) UNIQUE;
 `;
 
 async function init() {
