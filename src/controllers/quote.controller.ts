@@ -57,11 +57,10 @@ export async function getQuote(req: ChatRequest, res: Response) {
 
 export async function generatePdf(req: ChatRequest, res: Response) {
   try {
-    const pdfUrl = await quoteService.generateQuotationPdf(
-      req.factoryId!,
-      req.params.id as string
+    const { pdfUrl, leadEmail } = await quoteService.generateQuotationPdf(
+    req.factoryId!,
+    req.params.id as string
     );
-
     // Also fetch the factory email so n8n gets it directly!
     const client = await (await import("../config/db")).pool.connect();
     let ownerEmail = "sales@factory.com";
@@ -74,9 +73,26 @@ export async function generatePdf(req: ChatRequest, res: Response) {
       client.release();
     }
 
-    res.json({ pdfUrl, ownerEmail });
+    res.json({ pdfUrl, ownerEmail, customerEmail: leadEmail });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }
 }
 
+export async function approveQuote(req: ChatRequest, res: Response) {
+  try {
+    const quotation = await quoteService.updateQuotationStatus(req.factoryId!, req.params.id as string, "approved");
+    res.json(quotation);
+  } catch (err) {
+    res.status(404).json({ error: (err as Error).message });
+  }
+}
+
+export async function rejectQuote(req: ChatRequest, res: Response) {
+  try {
+    const quotation = await quoteService.updateQuotationStatus(req.factoryId!, req.params.id as string, "rejected");
+    res.json(quotation);
+  } catch (err) {
+    res.status(404).json({ error: (err as Error).message });
+  }
+}

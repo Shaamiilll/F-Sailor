@@ -1,23 +1,24 @@
+
 import { Response } from "express";
 import { ChatRequest } from "../middleware/chat.middleware";
 import * as mockupService from "../services/mockup.service";
 
 export async function createMockup(req: ChatRequest, res: Response) {
   try {
-    const { productId, leadId, logoUrl } = req.body;
+    const { product_id, logo_url, lead_id } = req.body;
 
-    if (!productId || !logoUrl) {
-      res.status(400).json({ error: "productId and logoUrl are required" });
-      return;
+    if (!product_id || !logo_url) {
+      return res.status(400).json({ error: "product_id and logo_url are required" });
     }
 
-    const mockup = await mockupService.createMockup(req.factoryId!, {
-      productId,
-      leadId,
-      logoUrl,
+    const mockupUrl = await mockupService.generateProductMockup({
+      factoryId: req.factoryId!,
+      productId: product_id,
+      logoUrl: logo_url,
+      leadId: lead_id,
     });
 
-    res.status(201).json(mockup);
+    res.status(201).json({ success: true, mockupUrl });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }

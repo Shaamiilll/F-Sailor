@@ -1,122 +1,146 @@
-import { GoogleGenAI } from "@google/genai";
+import sharp from "sharp";
 import fs from "fs";
 import path from "path";
-import crypto from "crypto";
 import { pool } from "../config/db";
 import { findProductById } from "./db.service";
-import { Mockup } from "../types";
-import { env } from "../config/env";
-
-/**
- * Uses Google's Gemini image model ("Nano Banana") to realistically place
- * a customer's logo onto a product photo — it blends the two images
- * together with lighting/angle/curvature taken into account, rather than
- * just pasting a flat sticker on top.
- *
- * Needs GEMINI_API_KEY set in .env (see setup guide).
- */
 
 const OUTPUT_DIR = path.join(__dirname, "../../uploads/mockups");
 
-const ai = new GoogleGenAI({ apiKey: env.geminiApiKey });
+/**
+ * Universal Image Loader:
+ * 1. Reads local files on your server/disk (e.g. "/uploads/products/Double-wall-cup.jpg")
+ * 2. Fetches public web links (http:// or https://) with content-type checking
+ * 3. Sanitizes and decodes Base64 data URLs (stripping corrupted whitespace)
+ */
+async function fetchImageBuffer(imagePathOrUrl: string, label: string = "IMAGE"): Promise<Buffer> {
+  const cleanInput = (imagePathOrUrl || "").trim();
 
-async function loadImageAsBase64(
-  source: string
-): Promise<{ data: string; mimeType: string }> {
-  let buffer: Buffer;
-  let mimeType = "image/png";
+  if (!cleanInput) {
+    throw new Error(`[${label}] Image path or URL is empty!`);
+  }
 
-  if (source.startsWith("http")) {
-    const response = await fetch(source); // Node 18+ has fetch built in
-    buffer = Buffer.from(await response.arrayBuffer());
-    const contentType = response.headers.get("content-type");
-    if (contentType) mimeType = contentType;
-  } else {
-    buffer = fs.readFileSync(source);
-    if (source.toLowerCase().endsWith(".jpg") || source.toLowerCase().endsWith(".jpeg")) {
-      mimeType = "image/jpeg";
+  // 1. Clean Base64 Handler (Removes corrupted spaces or line breaks)
+  if (cleanInput.startsWith("data:")) {
+    const parts = cleanInput.split(",");
+    if (parts.length > 1) {
+      const cleanBase64 = parts[1].replace(/[\s\r\n]+/g, ""); // Strips corrupted whitespace
+      try {
+        const buf = Buffer.from(cleanBase64, "base64");
+        // Verify buffer has valid image header bytes
+        if (buf.length < 10) throw new Error("Base64 buffer is too small to be an image");
+        return buf;
+      } catch (err) {
+        throw new Error(`[${label}] Base64 image decoding failed: ${(err as Error).message}`);
+      }
     }
   }
 
-  return { data: buffer.toString("base64"), mimeType };
+  // 2. Web Link (http:// or https://)
+  if (cleanInput.startsWith("http://") || cleanInput.startsWith("https://")) {
+    const response = await fetch(cleanInput);
+    if (!response.ok) {
+      throw new Error(`[${label}] Remote link returned HTTP status ${response.status}: ${cleanInput}`);
+    }
+
+    const contentType = response.headers.get("content-type") || "";
+    if (contentType.includes("text/html") || contentType.includes("application/json")) {
+      throw new Error(`[${label}] The URL returned a webpage/text, NOT an image file! Content-Type: ${contentType}`);
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    return Buffer.from(arrayBuffer);
+  }
+
+  // 3. Local File on Disk (e.g. "/uploads/products/Double-wall-cup.jpg")
+  const cleanPath = cleanInput.replace(/^\//, ""); // Remove leading slash
+  const localFilePath = path.join(__dirname, "../../", cleanPath);
+
+  if (fs.existsSync(localFilePath)) {
+    return fs.readFileSync(localFilePath);
+  }
+
+  // Fallback check from project root
+  const rootPath = path.join(process.cwd(), cleanPath);
+  if (fs.existsSync(rootPath)) {
+    return fs.readFileSync(rootPath);
+  }
+
+  throw new Error(`[${label}] Local image file not found on disk: ${cleanInput}`);
 }
 
-export async function createMockup(
-  factoryId: string,
-  params: { productId: string; leadId?: string; logoUrl: string }
-): Promise<Mockup> {
-  const product = await findProductById(params.productId, factoryId);
-  if (!product) throw new Error("Product not found");
-
-  const productImageUrl = (product as any).imageUrl;
-  if (!productImageUrl) {
-    throw new Error("This product has no base image uploaded yet");
-  }
-
+export async function generateProductMockup(params: {
+  factoryId: string;
+  productId: string;
+  logoUrl: string;
+  leadId?: string;
+}): Promise<string> {
   if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
-  const productImagePath = path.join(
-    __dirname,
-    "../../",
-    productImageUrl.replace(/^\//, "")
-  );
+  // 1. Smart product lookup (Supports UUID, Exact Name, or Hyphenated Slug!)
+  const product = await findProductById(params.productId, params.factoryId);
+  if (!product || !product.image_url) {
+    throw new Error(`Product blank image not found for product: ${params.productId}`);
+  }
+  const baseProductImageUrl = product.image_url;
 
-  const [productImage, logoImage] = await Promise.all([
-    loadImageAsBase64(productImagePath),
-    loadImageAsBase64(params.logoUrl),
-  ]);
+  // 2. Load both images with clear diagnostic labels
+  const productBuffer = await fetchImageBuffer(baseProductImageUrl, "PRODUCT");
+  const logoBuffer = await fetchImageBuffer(params.logoUrl, "LOGO");
 
-  const response = await ai.models.generateContent({
-    model: "gemini-2.5-flash-image",
-    contents: [
-      {
-        role: "user",
-        parts: [
-          { inlineData: { data: productImage.data, mimeType: productImage.mimeType } },
-          { inlineData: { data: logoImage.data, mimeType: logoImage.mimeType } },
-          {
-            text:
-              "The first image is a product photo. The second image is a customer's logo. " +
-              "Place the logo realistically onto the visible surface of the product, matching " +
-              "the product's lighting, angle, and any curvature, as if it were printed or " +
-              "stamped there. Keep the rest of the product photo unchanged.",
-          },
-        ],
-      },
-    ],
-  });
+  // 3. Read product image dimensions
+  const productMetadata = await sharp(productBuffer).metadata();
+  const width = productMetadata.width || 800;
+  const height = productMetadata.height || 800;
 
-  const parts = response.candidates?.[0]?.content?.parts || [];
-  const imagePart = parts.find((p: any) => p.inlineData) as any;
+  // 4. Resize logo proportionally (35% of product width so it NEVER distorts!)
+  const targetLogoWidth = Math.round(width * 0.35);
+  const resizedLogo = await sharp(logoBuffer)
+    .resize({ width: targetLogoWidth, fit: "inside" })
+    .toBuffer();
 
-  if (!imagePart) {
-    throw new Error(
-      "The AI model didn't return an image. Try a clearer product photo or logo."
-    );
+  const logoMetadata = await sharp(resizedLogo).metadata();
+  const logoWidth = logoMetadata.width || targetLogoWidth;
+  const logoHeight = logoMetadata.height || targetLogoWidth;
+
+  // 5. Smart Category Placement:
+  // - Cups & Drinkware: 45% (visual eye-level sweet spot)
+  // - Apparel & Hoodies: 32% (chest position)
+  // - Boxes, Bags & Packaging: 50% (dead center of lid)
+  let verticalRatio = 0.50;
+  const category = (product.category || "").toLowerCase();
+
+  if (category.includes("cup") || category.includes("drinkware") || category.includes("bottle")) {
+    verticalRatio = 0.45;
+  } else if (category.includes("apparel") || category.includes("hoodie") || category.includes("shirt")) {
+    verticalRatio = 0.32;
   }
 
-  const mockupId = crypto.randomUUID();
-  const fileName = `mockup-${mockupId}.png`;
+  const left = Math.round((width - logoWidth) / 2);
+  const top = Math.round((height * verticalRatio) - (logoHeight / 2));
+
+  // 6. Composite the logo cleanly onto the product
+  const fileName = `mockup-${Date.now()}.png`;
   const filePath = path.join(OUTPUT_DIR, fileName);
-  fs.writeFileSync(filePath, Buffer.from(imagePart.inlineData.data, "base64"));
 
-  const generatedImageUrl = `/uploads/mockups/${fileName}`;
+  await sharp(productBuffer)
+    // NEW:
+    .composite([{ input: resizedLogo, top, left, blend: "multiply" }])
+    .png({ quality: 95 })
+    .toFile(filePath);
 
-  const result = await pool.query(
-    `INSERT INTO mockups (factory_id, lead_id, product_id, logo_url, generated_image_url)
-     VALUES ($1, $2, $3, $4, $5)
-     RETURNING *`,
-    [factoryId, params.leadId || null, params.productId, params.logoUrl, generatedImageUrl]
-  );
+  const mockupUrl = `/uploads/mockups/${fileName}`;
 
-  const row = result.rows[0];
-  return {
-    id: row.id,
-    factoryId: row.factory_id,
-    leadId: row.lead_id,
-    productId: row.product_id,
-    logoUrl: row.logo_url,
-    generatedImageUrl: row.generated_image_url,
-    createdAt: row.created_at,
-  };
+  // 7. Save record permanently in PostgreSQL
+  const dbClient = await pool.connect();
+  try {
+    await dbClient.query(
+      `INSERT INTO mockups (factory_id, product_id, logo_url, generated_image_url, lead_id)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [params.factoryId, product.id, params.logoUrl, mockupUrl, params.leadId || null]
+    );
+  } finally {
+    dbClient.release();
+  }
+
+  return mockupUrl;
 }
