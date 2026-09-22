@@ -152,6 +152,155 @@ export async function findProductById(identifier: string, factoryId: string): Pr
   }
 }
 
+export async function createFactoryWithUser(
+  factory: { name: string; type: string; country: string; email: string; phone: string },
+  passwordHash: string
+): Promise<{ factory: Factory; user: User }> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const factoryResult = await client.query(
+      `INSERT INTO factories (name, type, country, email, phone)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [factory.name, factory.type, factory.country, factory.email.toLowerCase(), factory.phone]
+    );
+    const createdFactory = mapFactory(factoryResult.rows[0]);
+
+    const userResult = await client.query(
+      `INSERT INTO users (email, password_hash, role, factory_id)
+       VALUES ($1, $2, 'factory', $3)
+       RETURNING *`,
+      [factory.email.toLowerCase(), passwordHash, createdFactory.id]
+    );
+    const createdUser = mapUser(userResult.rows[0]);
+
+    await client.query("COMMIT");
+    return { factory: createdFactory, user: createdUser };
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+export async function createProduct(
+  factoryId: string,
+  input: {
+    name: string;
+    category: string;
+    specification: string;
+    capacity?: string;
+    material?: string;
+    dimensions?: string;
+    gsm?: string;
+    wallType?: string;
+    printingMethod?: string;
+    moq: number;
+    price: number;
+    currency: string;
+    leadTime: string;
+    description: string;
+    status: string;
+    size?: string;
+  }
+): Promise<Product> {
+  const result = await pool.query(
+    `INSERT INTO products (
+      factory_id, name, category, specification, capacity, material,
+      dimensions, gsm, wall_type, printing_method, moq, price, currency,
+      lead_time, description, status, size
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+    RETURNING *`,
+    [
+      factoryId,
+      input.name,
+      input.category,
+      input.specification,
+      input.capacity ?? null,
+      input.material ?? null,
+      input.dimensions ?? null,
+      input.gsm ?? null,
+      input.wallType ?? null,
+      input.printingMethod ?? null,
+      input.moq,
+      input.price,
+      input.currency,
+      input.leadTime,
+      input.description,
+      input.status,
+      input.size ?? null,
+    ]
+  );
+  return mapProduct(result.rows[0]);
+}
+
+export async function updateProduct(
+  productId: string,
+  factoryId: string,
+  input: Record<string, unknown>
+): Promise<Product | null> {
+  const columnMap: Record<string, string> = {
+    name: "name",
+    category: "category",
+    specification: "specification",
+    capacity: "capacity",
+    material: "material",
+    dimensions: "dimensions",
+    gsm: "gsm",
+    wallType: "wall_type",
+    printingMethod: "printing_method",
+    moq: "moq",
+    price: "price",
+    currency: "currency",
+    leadTime: "lead_time",
+    description: "description",
+    status: "status",
+    size: "size",
+  };
+
+  const sets: string[] = [];
+  const values: unknown[] = [];
+  let idx = 1;
+
+  for (const [key, column] of Object.entries(columnMap)) {
+    if (input[key] !== undefined) {
+      sets.push(`${column} = $${idx}`);
+      values.push(input[key]);
+      idx += 1;
+    }
+  }
+
+  if (sets.length === 0) {
+    const existing = await pool.query(
+      "SELECT * FROM products WHERE id = $1 AND factory_id = $2",
+      [productId, factoryId]
+    );
+    return existing.rows[0] ? mapProduct(existing.rows[0]) : null;
+  }
+
+  sets.push(`updated_at = NOW()`);
+  values.push(productId, factoryId);
+
+  const result = await pool.query(
+    `UPDATE products SET ${sets.join(", ")}
+     WHERE id = $${idx} AND factory_id = $${idx + 1}
+     RETURNING *`,
+    values
+  );
+  return result.rows[0] ? mapProduct(result.rows[0]) : null;
+}
+
+export async function deleteProduct(productId: string, factoryId: string): Promise<boolean> {
+  const result = await pool.query(
+    "DELETE FROM products WHERE id = $1 AND factory_id = $2 RETURNING id",
+    [productId, factoryId]
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
 export function productToResponse(product: Product) {
   return {
     id: product.id,

@@ -78,7 +78,7 @@ router.post("/upload", async (req: ChatRequest, res: Response): Promise<void> =>
 // Get a single product by ID OR by Product Name (No Red Lines!)
 router.get("/products/:id", async (req: ChatRequest, res: Response): Promise<void> => {
   try {
-    const product = await findProductById(req.params.id, req.factoryId!);
+    const product = await findProductById(req.params.id as string, req.factoryId!);
 
     if (!product) {
       res.status(404).json({ error: "Product not found" });

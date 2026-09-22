@@ -6,7 +6,7 @@ import { pool } from "../config/db";
 // GET /chat/history/:userId
 export async function getHistory(req: ChatRequest, res: Response) {
   try {
-    const { userId } = req.params;
+    const userId = req.params.userId as string;
     const limit = req.query.limit ? parseInt(req.query.limit as string) : 20;
 
     const history = await memoryService.getChatHistory(
