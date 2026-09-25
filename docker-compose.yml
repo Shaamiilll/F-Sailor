@@ -1,0 +1,18 @@
+services:
+  backend:
+    build: .
+    container_name: factory-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:4000:4000"
+    volumes:
+      - ./uploads:/app/uploads
+    networks:
+      - factory-network
+
+networks:
+  factory-network:
+    external: true
+    name: postgres_factory-network
