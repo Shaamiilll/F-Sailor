@@ -7,7 +7,11 @@ const router = Router();
 router.use(authMiddleware, factoryMiddleware);
 
 router.get("/", quoteDashboardController.listQuotations);
+router.get("/:id", quoteDashboardController.getQuotation);
+router.patch("/:id", quoteDashboardController.updateQuotation);
 router.post("/:id/approve", quoteDashboardController.approveQuotation);
 router.post("/:id/reject", quoteDashboardController.rejectQuotation);
+router.post("/:id/send", quoteDashboardController.markQuotationSent);
+router.post("/:id/pdf", quoteDashboardController.renderQuotationPdf);
 
 export default router;

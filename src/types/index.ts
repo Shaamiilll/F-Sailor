@@ -1,4 +1,6 @@
-export type UserRole = "admin" | "factory";
+// "customer" is a storefront buyer. Buyers live in `leads`, not `users`, so
+// this role only ever appears inside a JWT -- never in users.role.
+export type UserRole = "admin" | "factory" | "customer";
 
 export interface User {
   id: string;
@@ -50,6 +52,8 @@ export interface JwtPayload {
   email: string;
   role: UserRole;
   factoryId: string | null;
+  // Set only on customer tokens: the `leads` row this buyer is.
+  leadId?: string | null;
 }
 
 export interface CreateFactoryInput {
@@ -133,7 +137,13 @@ export interface ShippingRate {
   rateValue: number;
 }
 
-export type QuotationStatus = "draft" | "sent" | "approved" | "rejected";
+export type QuotationStatus =
+  | "draft"
+  | "pending"
+  | "sent"
+  | "approved"
+  | "rejected"
+  | "expired";
 
 export interface Quotation {
   id: string;
@@ -161,4 +171,80 @@ export interface Mockup {
   logoUrl: string;
   generatedImageUrl: string | null;
   createdAt: Date;
+}
+
+// --- Commerce: multi-item quotations and the orders they become ---------------
+
+export interface QuotationItem {
+  id: string;
+  quotationId: string;
+  productId: string | null;
+  productName: string;
+  quantity: number;
+  unitPrice: number;
+  lineTotal: number;
+  customization: string | null;
+  sortOrder: number;
+}
+
+export type OrderStatus =
+  | "quote"
+  | "accepted"
+  | "payment_pending"
+  | "paid"
+  | "production"
+  | "shipped"
+  | "completed";
+
+export const ORDER_STATUSES: OrderStatus[] = [
+  "quote",
+  "accepted",
+  "payment_pending",
+  "paid",
+  "production",
+  "shipped",
+  "completed",
+];
+
+export interface Order {
+  id: string;
+  factoryId: string;
+  leadId: string | null;
+  quotationId: string | null;
+  orderNumber: string;
+  totalPrice: number;
+  currency: string;
+  status: OrderStatus;
+  estimatedDelivery: string | null;
+  trackingNumber: string | null;
+  notes: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface OrderStatusHistoryEntry {
+  id: string;
+  orderId: string;
+  status: OrderStatus;
+  note: string | null;
+  changedBy: string | null;
+  createdAt: Date;
+}
+
+export type CustomerStatus = "prospect" | "active" | "inactive";
+
+/** A line the storefront cart submits. */
+export interface QuoteRequestLine {
+  productId: string;
+  quantity: number;
+  customization?: string | null;
+}
+
+export interface QuoteRequestInput {
+  lines: QuoteRequestLine[];
+  tradeTerm?: string;
+  destinationCountry?: string | null;
+  colorCount?: number;
+  plateCost?: number;
+  customerNotes?: string | null;
 }

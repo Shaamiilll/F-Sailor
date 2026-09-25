@@ -189,3 +189,109 @@ When ready to eliminate all test demonstration factories and records, run:
 -- ```sql
 DELETE FROM factories WHERE email LIKE '%@testfactory.com';
 (All associated products, quotes, mockups, and tiers will cascade-delete automatically).
+---
+
+## 6. Storefront Commerce: Quotation → Order Flow
+
+Added on top of everything above. No pre-existing endpoint, service or table was
+removed, and the `/api/chat` automation gateway is untouched — the only altered
+constraint is `quotations_status_check`, which was *widened* (see below).
+
+Migration: `npm run db:migrate` (`src/db/migrate-commerce.ts`, idempotent). The same
+DDL runs inside `npm run db:init` so fresh installs match.
+
+### A. Schema additions
+
+| Table | Change |
+|---|---|
+| `leads` | `password_hash`, `status` (`prospect`/`active`/`inactive`), unique index on `(factory_id, LOWER(email))`. Leads now double as the **customer** record: the row the chatbot upserts is the row a storefront buyer signs in to. |
+| `quotations` | `quote_number`, `valid_until`, `notes`, `customer_notes`, `destination_country`, `setup_fees`, `source` (`chatbot`/`storefront`). Status CHECK widened from `draft/sent/approved/rejected` to also allow `pending` and `expired`; every previous value stays legal. |
+| `quotation_items` | **New.** One row per product on a quotation. `quotations.product_id/quantity/unit_price` are still populated from the first line so the chat flow and PDF generator keep working. |
+| `orders` | **New.** `quotation_id` is UNIQUE — that is what makes approval idempotent. Status CHECK mirrors the frontend `OrderStatus` union exactly, so no mapping layer exists. |
+| `order_status_history` | **New.** Append-only audit of every status change, with the note and the user who made it. |
+| `factories` | `plate_cost_default`, `color_fee_default`, `default_currency`, `quote_validity_days` — the tooling fees that were previously magic numbers are now editable settings. |
+| sequences | `quote_number_seq`, `order_number_seq` → `QT-2026-000123` / `ORD-2026-000123` (`src/services/numbering.service.ts`). |
+
+### B. New services (`src/services/`)
+
+* `quote-request.service.ts` — prices a cart and persists it. Volume discount, freight
+  and setup fees all come from `calculateQuote()` (the existing engine, reading real
+  `discount_tiers` / `shipping_rates`); because a cart has several unit prices, the
+  engine is handed a blended price purely to *derive the rules*, then the money is
+  rebuilt from exact per-line sums so a 4-dp blended price can't drift at 50,000 units.
+  Validates MOQ and factory ownership on every line.
+* `order.service.ts` — `createOrderFromQuotation` (idempotent, accepts a caller's
+  transaction client), status transitions with history, fulfilment fields.
+* `customer-auth.service.ts` — buyer register/login. Issues a JWT with
+  `role: "customer"` and `leadId`; refuses to overwrite an account that already has a
+  password.
+* `quotation-view.service.ts`, `customer.service.ts`, `dashboard.service.ts`,
+  `settings.service.ts`, `inbox.service.ts` — factory-scoped read models returning the
+  camelCase shapes the UI renders. Chat-created single-product quotations are presented
+  as a one-line quotation so every consumer can just read `items`.
+* `numbering.service.ts` also exports `toDateOnly()`: node-postgres returns a `DATE` as
+  a Date at *local* midnight, so `.toISOString()` reports the previous day east of UTC.
+  Every DATE column is serialised through it as `YYYY-MM-DD`.
+
+### C. Authentication boundary
+
+`customerMiddleware` (`src/middleware/customer.middleware.ts`) requires
+`role === "customer"`; the pre-existing `factoryMiddleware` requires `role === "factory"`.
+Same `JWT_SECRET`, mutually exclusive roles — a buyer's token gets 403 from
+`/api/products`, and a factory token gets 403 from `/api/public/me/*`. Every `/me/*`
+handler filters by `leadId` **and** `factoryId`.
+
+### D. API reference — storefront (`/api/public`)
+
+| Method | Path | Auth |
+|---|---|---|
+| GET | `/factories/:username` | none |
+| GET | `/factories/:username/products` | none |
+| GET | `/factories/:username/products/:id` | none |
+| POST | `/factories/:username/quote-preview` | none — live cart pricing, persists nothing |
+| POST | `/factories/:username/customers/register` | none |
+| POST | `/factories/:username/customers/login` | none |
+| GET | `/me` | customer |
+| POST | `/me/quote-requests` | customer — creates a `pending` quotation + items |
+| GET | `/me/quotations`, `/me/quotations/:id` | customer |
+| POST | `/me/quotations/:id/pdf` | customer |
+| GET | `/me/orders`, `/me/orders/:id` | customer |
+
+### E. API reference — dashboard (factory JWT)
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/api/quotations`, `/api/quotations/:id` | enriched: customer, `items[]`, quote number, linked order |
+| POST | `/api/quotations/:id/approve` | **sets `approved` and opens the order, in one transaction.** Returns `{ quotation, order }` |
+| POST | `/api/quotations/:id/reject`, `/send`, `/pdf` | |
+| PATCH | `/api/quotations/:id` | internal notes, validity date |
+| GET | `/api/customers`, `/api/customers/:id` | detail returns profile + quotations + orders + merged activity timeline |
+| PATCH | `/api/customers/:id` | notes, status, contact fields |
+| GET | `/api/orders`, `/api/orders/:id` | detail returns `{ order, history }` |
+| PATCH | `/api/orders/:id/status` | validates against the CHECK list, appends history |
+| PATCH | `/api/orders/:id` | estimated delivery, tracking, notes |
+| GET | `/api/dashboard/stats`, `/api/dashboard/analytics?days=N` | SQL aggregates; `generate_series` fills zero-activity days |
+| GET | `/api/settings` · PATCH `/api/settings/factory` | profile + tooling fees + validity |
+| POST/DELETE | `/api/settings/discount-tiers[/:id]` | the rules `pricing.service.ts` reads |
+| POST/DELETE | `/api/settings/shipping-rates[/:id]` | |
+| GET | `/api/inbox/conversations`, `/conversations/:id/messages`, `/mockups` | read-only views of the chat gateway's tables |
+
+### F. Onboarding a factory for the storefront
+
+Steps 1–4 of Section 5 still apply, with two additions:
+
+1. The factory **must** have `factories.username` set — that is the subdomain the
+   storefront is served on (`acme.yourdomain.com`). Without it the storefront 404s and
+   the dashboard shows a notice saying so.
+2. Discount tiers, freight rates and tooling fees no longer need raw SQL. The factory
+   enters them at **Settings → Pricing & Discounts / Shipping**, and quotations pick
+   them up immediately. With none configured, quoting is correct and simply applies no
+   discount and no freight.
+
+### G. Referential-integrity note
+
+`quotations.lead_id` cascades on customer delete (pre-existing behaviour), while
+`orders.lead_id` / `orders.quotation_id` are `ON DELETE SET NULL` — an order is a
+financial record and must not vanish because a contact was removed. Deleting a customer
+therefore leaves their orders in place with a null customer; the dashboard renders those
+as "Unknown customer".

@@ -2,6 +2,7 @@ import { pool } from "../config/db";
 import { calculateQuote } from "./pricing.service";
 import { findProductById, findFactoryById } from "./db.service";
 import { generateQuotationPdf as buildPdf } from "./pdf.service";
+import { nextQuoteNumber, toDateOnly } from "./numbering.service";
 import { Quotation } from "../types";
 
 function mapQuotation(row: Record<string, unknown>): Quotation {
@@ -23,6 +24,10 @@ function mapQuotation(row: Record<string, unknown>): Quotation {
     createdAt: row.created_at as Date,
   };
 }
+
+// Columns added for the storefront flow that createQuotation does not set.
+// Chat-created quotations get their quote number here so every quotation in the
+// dashboard has one, regardless of which channel created it.
 
 export async function createQuotation(
   factoryId: string,
@@ -128,7 +133,36 @@ export async function createQuotation(
       ]
     );
 
-    return mapQuotation(result.rows[0]);
+    const created = mapQuotation(result.rows[0]);
+
+    const quoteNumber = await nextQuoteNumber(client);
+    await client.query(
+      `UPDATE quotations
+          SET quote_number = $1,
+              setup_fees = $2,
+              valid_until = (NOW() + (COALESCE(
+                (SELECT quote_validity_days FROM factories WHERE id = $3), 30
+              ) || ' days')::INTERVAL)::DATE
+        WHERE id = $4`,
+      [quoteNumber, quote.totalSetupFees, factoryId, created.id]
+    );
+
+    await client.query(
+      `INSERT INTO quotation_items (
+         quotation_id, product_id, product_name, quantity,
+         unit_price, line_total, sort_order
+       ) VALUES ($1, $2, $3, $4, $5, $6, 0)`,
+      [
+        created.id,
+        product.id,
+        product.name,
+        quote.quantity,
+        quote.effectiveUnitPrice,
+        quote.productSubtotal,
+      ]
+    );
+
+    return created;
   } finally {
     client.release();
   }
@@ -164,6 +198,32 @@ export async function generateQuotationPdf(factoryId: string, id: string): Promi
     }
   }
 
+  // Multi-item quotations keep their lines in quotation_items; chat-created ones
+  // have none, and buildPdf falls back to the single-product params below.
+  const itemsResult = await pool.query(
+    `SELECT product_name, quantity, unit_price, line_total, customization
+       FROM quotation_items WHERE quotation_id = $1
+      ORDER BY sort_order, created_at`,
+    [q.id]
+  );
+  const items = itemsResult.rows.map((row) => ({
+    productName: row.product_name as string,
+    quantity: Number(row.quantity),
+    unitPrice: Number(row.unit_price),
+    lineTotal: Number(row.line_total),
+    customization: (row.customization as string) ?? null,
+  }));
+
+  const metaResult = await pool.query(
+    `SELECT q.quote_number, q.valid_until, q.trade_term, q.setup_fees,
+            f.quote_validity_days
+       FROM quotations q
+       JOIN factories f ON f.id = q.factory_id
+      WHERE q.id = $1`,
+    [q.id]
+  );
+  const meta = metaResult.rows[0] ?? {};
+
   const pdfUrl = await buildPdf({
     quotationId: q.id,
     factoryName: factory?.name || "Factory",
@@ -181,10 +241,23 @@ export async function generateQuotationPdf(factoryId: string, id: string): Promi
     leadName,
     leadCompany,
     leadEmail,
+    items,
+    subtotal: q.subtotal,
+    setupFees: Number(meta.setup_fees ?? 0),
+    quoteNumber: meta.quote_number ?? null,
+    validUntil: toDateOnly(meta.valid_until),
+    tradeTerm: meta.trade_term ?? null,
+    validityDays: Number(meta.quote_validity_days) || 30,
   });
 
+  // Record the PDF. Only advance the status for quotes still awaiting a
+  // decision -- re-rendering an approved or rejected quote must not reopen it.
   await pool.query(
-    "UPDATE quotations SET pdf_url = $1, status = 'sent', updated_at = NOW() WHERE id = $2",
+    `UPDATE quotations
+        SET pdf_url = $1,
+            status = CASE WHEN status IN ('draft', 'pending') THEN 'sent' ELSE status END,
+            updated_at = NOW()
+      WHERE id = $2`,
     [pdfUrl, q.id]
   );
 

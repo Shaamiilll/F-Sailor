@@ -1,6 +1,7 @@
 import bcrypt from "bcryptjs";
 import { pool } from "../config/db";
 import { env } from "../config/env";
+import { commerceSchema } from "./migrate-commerce";
 
 const schema = `
 CREATE TABLE IF NOT EXISTS factories (
@@ -159,6 +160,8 @@ async function init() {
   const client = await pool.connect();
   try {
     await client.query(schema);
+    // Quotation items, orders, customer logins and document numbering.
+    await client.query(commerceSchema);
 
     const adminCheck = await client.query(
       "SELECT id FROM users WHERE email = $1",

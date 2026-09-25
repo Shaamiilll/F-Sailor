@@ -4,6 +4,14 @@ import path from "path";
 
 const OUTPUT_DIR = path.join(__dirname, "../../uploads/quotations");
 
+export interface QuotationPdfLine {
+  productName: string;
+  quantity: number;
+  unitPrice: number;
+  lineTotal: number;
+  customization?: string | null;
+}
+
 export interface QuotationPdfParams {
   quotationId: string;
   factoryName: string;
@@ -11,6 +19,7 @@ export interface QuotationPdfParams {
   factoryEmail?: string;
   factoryPhone?: string;
   factoryCountry?: string;
+  /** Single-product summary, kept for the chat/n8n callers that only have this. */
   productName: string;
   quantity: number;
   unitPrice: number;
@@ -22,6 +31,14 @@ export interface QuotationPdfParams {
   leadName?: string | null;
   leadCompany?: string | null;
   leadEmail?: string | null;
+  /** Multi-item quotations pass their real line items here. */
+  items?: QuotationPdfLine[];
+  subtotal?: number;
+  setupFees?: number;
+  quoteNumber?: string | null;
+  validUntil?: string | null;
+  tradeTerm?: string | null;
+  validityDays?: number;
 }
 
 // Helper to fetch image from URL or read from local disk
@@ -42,8 +59,42 @@ async function getImageBuffer(imagePathOrUrl?: string | null): Promise<Buffer | 
   return null;
 }
 
+function money(value: number, maxDecimals = 2): string {
+  return Number(value).toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: maxDecimals,
+  });
+}
+
+function formatDate(date: Date): string {
+  return date.toLocaleDateString("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+}
+
 export async function generateQuotationPdf(params: QuotationPdfParams): Promise<string> {
   if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+
+  // Multi-item quotations pass real lines. The chat/n8n gateway only knows about
+  // one product, so synthesise a single line from the flat params instead.
+  const lines: QuotationPdfLine[] =
+    params.items && params.items.length > 0
+      ? params.items
+      : [
+          {
+            productName: params.productName,
+            quantity: params.quantity,
+            unitPrice: params.unitPrice,
+            lineTotal: params.unitPrice * params.quantity,
+          },
+        ];
+
+  const subtotal = params.subtotal ?? lines.reduce((sum, l) => sum + l.lineTotal, 0);
+  const setupFees = params.setupFees ?? 0;
+  const freight = params.shippingCost;
+  const validityDays = params.validityDays ?? 30;
 
   const fileName = `quotation-${params.quotationId}.pdf`;
   const filePath = path.join(OUTPUT_DIR, fileName);
@@ -90,9 +141,21 @@ export async function generateQuotationPdf(params: QuotationPdfParams): Promise<
     .fontSize(9)
     .font("Helvetica")
     .fillColor(secondaryColor)
-    .text(`Quote #: ${params.quotationId.substring(0, 8).toUpperCase()}`, 350, headerTop + 24, { align: "right" })
-    .text(`Date: ${new Date().toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" })}`, 350, headerTop + 36, { align: "right" })
-    .text(`Valid For: 30 Days`, 350, headerTop + 48, { align: "right" });
+    .text(
+      `Quote #: ${params.quoteNumber || params.quotationId.substring(0, 8).toUpperCase()}`,
+      350,
+      headerTop + 24,
+      { align: "right" }
+    )
+    .text(`Date: ${formatDate(new Date())}`, 350, headerTop + 36, { align: "right" })
+    .text(
+      params.validUntil
+        ? `Valid Until: ${formatDate(new Date(params.validUntil))}`
+        : `Valid For: ${validityDays} Days`,
+      350,
+      headerTop + 48,
+      { align: "right" }
+    );
 
   // Divider Line
   doc.strokeColor("#E2E8F0").lineWidth(1).moveTo(40, 105).lineTo(555, 105).stroke();
@@ -128,30 +191,51 @@ export async function generateQuotationPdf(params: QuotationPdfParams): Promise<
     .text("UNIT PRICE", 380, tableTop + 8, { width: 80, align: "right" })
     .text("AMOUNT", 470, tableTop + 8, { width: 75, align: "right" });
 
-  // Table Row
-  const rowTop = tableTop + 32;
-  const subtotal = params.unitPrice * params.quantity;
+  // Table Rows -- one per quotation line item
+  let rowTop = tableTop + 32;
 
-  doc
-    .fillColor(primaryColor)
-    .font("Helvetica-Bold")
-    .fontSize(10)
-    .text(params.productName, 55, rowTop)
-    .font("Helvetica")
-    .fontSize(9)
-    .fillColor(secondaryColor)
-    .text("Custom production as per specifications", 55, rowTop + 14)
-    .text(`${params.quantity}`, 320, rowTop + 5, { width: 50, align: "center" })
-    .text(`${params.currency} ${params.unitPrice.toFixed(2)}`, 380, rowTop + 5, { width: 80, align: "right" })
-    .font("Helvetica-Bold")
-    .fillColor(primaryColor)
-    .text(`${params.currency} ${subtotal.toFixed(2)}`, 470, rowTop + 5, { width: 75, align: "right" });
+  for (const line of lines) {
+    doc
+      .fillColor(primaryColor)
+      .font("Helvetica-Bold")
+      .fontSize(10)
+      .text(line.productName, 55, rowTop, { width: 255 })
+      .font("Helvetica")
+      .fontSize(9)
+      .fillColor(secondaryColor)
+      .text(
+        line.customization || "Custom production as per specifications",
+        55,
+        rowTop + 14,
+        { width: 255 }
+      )
+      .text(line.quantity.toLocaleString("en-US"), 320, rowTop + 5, {
+        width: 50,
+        align: "center",
+      })
+      .text(`${params.currency} ${money(line.unitPrice, 4)}`, 380, rowTop + 5, {
+        width: 80,
+        align: "right",
+      })
+      .font("Helvetica-Bold")
+      .fillColor(primaryColor)
+      .text(`${params.currency} ${money(line.lineTotal)}`, 470, rowTop + 5, {
+        width: 75,
+        align: "right",
+      });
 
-  // Underline product row
-  doc.strokeColor("#E2E8F0").lineWidth(1).moveTo(40, rowTop + 35).lineTo(555, rowTop + 35).stroke();
+    doc
+      .strokeColor("#E2E8F0")
+      .lineWidth(1)
+      .moveTo(40, rowTop + 32)
+      .lineTo(555, rowTop + 32)
+      .stroke();
+
+    rowTop += 42;
+  }
 
   // 4. SUMMARY / TOTALS SECTION
-  let totalsY = rowTop + 50;
+  let totalsY = rowTop + 15;
 
   const drawSummaryLine = (label: string, value: string, isBold: boolean = false) => {
     doc
@@ -163,17 +247,26 @@ export async function generateQuotationPdf(params: QuotationPdfParams): Promise<
     totalsY += 18;
   };
 
-  drawSummaryLine("Subtotal", `${params.currency} ${subtotal.toFixed(2)}`);
+  drawSummaryLine("Subtotal", `${params.currency} ${money(subtotal)}`);
 
   if (params.discountPercent > 0) {
     drawSummaryLine(
       `Volume Discount (${params.discountPercent}%)`,
-      `-${params.currency} ${params.discountAmount.toFixed(2)}`
+      `-${params.currency} ${money(params.discountAmount)}`
     );
   }
 
-  if (params.shippingCost > 0) {
-    drawSummaryLine("Estimated Shipping", `${params.currency} ${params.shippingCost.toFixed(2)}`);
+  if (setupFees > 0) {
+    drawSummaryLine("Tooling & Plate Setup", `${params.currency} ${money(setupFees)}`);
+  }
+
+  if (freight > 0) {
+    drawSummaryLine(
+      params.tradeTerm ? `Freight (${params.tradeTerm})` : "Estimated Shipping",
+      `${params.currency} ${money(freight)}`
+    );
+  } else if (params.tradeTerm) {
+    drawSummaryLine(`Freight (${params.tradeTerm})`, "Not included");
   }
 
   // Grand Total Highlight Box
@@ -185,7 +278,10 @@ export async function generateQuotationPdf(params: QuotationPdfParams): Promise<
     .fontSize(11)
     .text("GRAND TOTAL", 335, totalsY + 10)
     .fontSize(12)
-    .text(`${params.currency} ${params.totalPrice.toFixed(2)}`, 430, totalsY + 10, { width: 115, align: "right" });
+    .text(`${params.currency} ${money(params.totalPrice)}`, 430, totalsY + 10, {
+      width: 115,
+      align: "right",
+    });
 
   // 5. FOOTER & TERMS
   const footerY = 740;
@@ -196,7 +292,11 @@ export async function generateQuotationPdf(params: QuotationPdfParams): Promise<
     .font("Helvetica")
     .fontSize(8)
     .text("Terms & Conditions:", 40, footerY + 10)
-    .text("• Quotation is valid for 30 calendar days from the date of issue.", 40, footerY + 22)
+    .text(
+      `• Quotation is valid for ${validityDays} calendar days from the date of issue.`,
+      40,
+      footerY + 22
+    )
     .text("• Production initiates upon formal confirmation and deposit approval.", 40, footerY + 32)
     .font("Helvetica-Bold")
     .text(`Thank you for choosing ${params.factoryName}!`, 40, footerY + 46, { align: "center" });

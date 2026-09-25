@@ -6,7 +6,8 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "db:init": "tsx src/db/init.ts"
+    "db:init": "tsx src/db/init.ts",
+    "db:migrate": "tsx src/db/migrate-commerce.ts"
   },
   "dependencies": {
     "@google/genai": "^2.21.0",
