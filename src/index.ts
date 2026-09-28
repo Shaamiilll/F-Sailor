@@ -15,7 +15,7 @@ import inboxRoutes from "./routes/inbox.routes";
 
 const app = express();
 
-// NEW: Universal CORS + 25MB Photo Upload Support!
+// NEW: Universal CORS + 30B Photo Upload Support!
 app.use(
   cors({
     origin: true, // Allows Vercel, localhost:3000, and local preview tests without CORS blocks!
