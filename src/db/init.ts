@@ -151,7 +151,7 @@ CREATE INDEX IF NOT EXISTS idx_mockups_product ON mockups(product_id);
 ALTER TABLE products ADD COLUMN IF NOT EXISTS image_url VARCHAR(500);
 ALTER TABLE factories ADD COLUMN IF NOT EXISTS logo_url VARCHAR(500);
 
--- Username doubles as the factory's subdomain (e.g. acme.factoryflow.com).
+-- Username doubles as the factory's subdomain (e.g. acme.kayanflow.com).
 -- Added after the original schema, so older rows may not have one yet.
 ALTER TABLE factories ADD COLUMN IF NOT EXISTS username VARCHAR(63) UNIQUE;
 `;
