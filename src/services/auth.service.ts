@@ -3,6 +3,27 @@ import jwt from "jsonwebtoken";
 import { env } from "../config/env";
 import { findUserByEmail, findUserById, findFactoryById } from "./db.service";
 import { JwtPayload } from "../types";
+import * as subscriptions from "./subscription.service";
+
+/**
+ * The subscription facts the frontend needs right after sign-in, so it can send
+ * an unpaid or lapsed account to checkout instead of a dashboard that would
+ * answer 402 to everything.
+ */
+async function subscriptionSummary(factoryId: string | null) {
+  if (!factoryId) return null;
+  const sub = await subscriptions.getSubscription(factoryId);
+  if (!sub) return null;
+  return {
+    plan: sub.plan,
+    interval: sub.interval,
+    status: sub.status,
+    usable: subscriptions.isUsable(sub.status),
+    provisionedBy: sub.provisionedBy,
+    currentPeriodEnd: sub.currentPeriodEnd,
+    cancelAtPeriodEnd: sub.cancelAtPeriodEnd,
+  };
+}
 
 export async function login(email: string, password: string) {
   const user = await findUserByEmail(email);
@@ -37,6 +58,7 @@ export async function login(email: string, password: string) {
       role: user.role,
       factoryId: user.factoryId,
     },
+    subscription: await subscriptionSummary(user.factoryId),
     factory: factory
       ? {
           id: factory.id,
@@ -77,5 +99,6 @@ export async function getMe(userId: string) {
     role: user.role,
     factoryId: user.factoryId,
     factory,
+    subscription: await subscriptionSummary(user.factoryId),
   };
 }

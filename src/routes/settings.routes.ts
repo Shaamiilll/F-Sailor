@@ -1,10 +1,11 @@
 import { Router } from "express";
 import * as settingsController from "../controllers/settings.controller";
 import { authMiddleware, factoryMiddleware } from "../middleware/auth.middleware";
+import { requireActiveSubscription } from "../middleware/subscription.middleware";
 
 const router = Router();
 
-router.use(authMiddleware, factoryMiddleware);
+router.use(authMiddleware, factoryMiddleware, requireActiveSubscription);
 
 router.get("/", settingsController.getSettings);
 router.patch("/factory", settingsController.updateFactory);

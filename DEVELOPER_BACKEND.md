@@ -295,3 +295,163 @@ Steps 1–4 of Section 5 still apply, with two additions:
 financial record and must not vanish because a contact was removed. Deleting a customer
 therefore leaves their orders in place with a null customer; the dashboard renders those
 as "Unknown customer".
+
+---
+
+## 7. SaaS Billing: Self-Serve Signup, Plans & Stripe
+
+The platform is self-serve. A visitor creates their own factory from the public
+site, pays through Stripe, and their subdomain goes live — no admin involved.
+An admin can still provision a factory directly, which takes no payment.
+
+### A. The plan catalog is data, not code
+
+Plans live in the `plans` table and are managed from the admin panel
+(**Admin → Plans & pricing**). Prices, channel limits, mockup allowances and
+feature lists are all editable at runtime, and the public pricing page, the
+signup form and every factory's limits read from the same rows.
+
+`src/config/plans.ts` holds only the TypeScript shape plus `DEFAULT_PLANS`, the
+three tiers seeded on first migration. Nothing reads those defaults at runtime —
+reading them would make an admin's edits invisible.
+
+| Column | Meaning |
+| --- | --- |
+| `code` | Stable identifier stored on `factories.plan`. Immutable once set. |
+| `monthly_price` / `annual_price` | USD. `0` for an interval means that interval is not sold. |
+| `channel_limit` | How many sales channels may be active at once. |
+| `monthly_mockup_limit` | AI logo mockups allowed per calendar month. |
+| `features` | JSONB array of strings, rendered on the pricing page. |
+| `active` | `false` hides it from pricing while existing subscribers keep working. |
+| `stripe_product_id`, `stripe_*_price_id` | Written by the Stripe sync. |
+
+### B. Factory lifecycle
+
+`factories.status` gates access:
+
+| Status | Dashboard access | Meaning |
+| --- | --- | --- |
+| `pending` | no (402) | Registered, subdomain reserved, has not paid. |
+| `active` | yes | Paid, or admin-provisioned. |
+| `past_due` | yes | Card failed. Kept in with a banner — a lapsed card should not lock a factory out of its own data. |
+| `canceled` | no (402) | Subscription ended. Data retained, access not. |
+| `suspended` | no (402) | Switched off by an admin. |
+
+`provisioned_by` is `self_serve` or `admin`. An `admin` factory has no Stripe
+subscription by design and is never chased for payment.
+
+`requireActiveSubscription` (`src/middleware/subscription.middleware.ts`) guards
+every factory dashboard router. It answers **402**, not 403, so the frontend
+keeps the session and routes to checkout instead of logging the user out.
+`/api/billing/*` is deliberately *not* behind it — that is the one area a lapsed
+account needs in order to start paying again.
+
+### C. Signup flow
+
+```
+POST /api/public/register
+  -> factory row created as `pending`, subdomain reserved, website channel seeded
+  -> Stripe Checkout session created (factory_id in metadata)
+  -> { factory, checkoutUrl }
+
+browser -> Stripe Checkout -> payment
+
+Stripe -> POST /api/billing/webhook (checkout.session.completed)
+  -> factory flips to `active`
+```
+
+The **webhook**, not the browser redirect, grants access: a user can close the
+tab before redirecting back, and a redirect URL can be forged — a signed webhook
+cannot be. The success page additionally re-reads the session *from Stripe* as a
+fallback for when the webhook is slow, which is safe because the session is
+re-fetched rather than trusted from the query string.
+
+If Stripe refuses to open checkout, the factory and user rows are rolled back —
+otherwise an unpayable `pending` account would squat on the subdomain forever.
+
+### D. Setup
+
+```bash
+# 1. Apply the billing schema and seed the three default plans.
+#    Idempotent: re-running never re-seeds or re-promotes anyone.
+npm run db:migrate:billing
+
+# 2. Add your Stripe test key to backend/.env
+#    STRIPE_SECRET_KEY=sk_test_...
+
+# 3. Push the plan catalog into Stripe (creates products + prices,
+#    writes the ids back onto each plan row).
+npm run stripe:sync
+
+# 4. Forward webhooks locally, then copy the printed whsec_ into
+#    STRIPE_WEBHOOK_SECRET in backend/.env
+stripe listen --forward-to localhost:4000/api/billing/webhook
+```
+
+There are **no price ids in `.env`** — each plan row carries its own, because an
+admin can create a plan at runtime. Saving a plan in the admin panel syncs it to
+Stripe automatically; `npm run stripe:sync` is for first setup, or for pointing
+an existing catalog at a new Stripe account.
+
+Without `STRIPE_SECRET_KEY` the server still boots: self-serve signup and the
+billing endpoints return a clear **503**, and an admin can provision factories
+by hand.
+
+**Migration note:** factories that predate billing are grandfathered onto the
+highest-priced plan with `status = 'active'` and `provisioned_by = 'admin'`, so
+nobody loses a capability they already had. This runs only on the first
+migration, detected by the absence of `factories.plan`.
+
+### E. Limit enforcement
+
+- **Mockups** — checked in `mockup.controller.createMockup` before generating
+  (the expensive step), not only on the `/quota` endpoint, because the bot is
+  free to skip that check. Over quota returns **403 `QUOTA_EXCEEDED`**.
+- **Channels** — `setChannelEnabled` locks the factory row, counts active
+  channels and refuses past the limit in one transaction, so two concurrent
+  enables cannot both slip through. Returns **400 `PLAN_LIMIT`**.
+- **Downgrades** never fail. Dropping to a smaller plan keeps the oldest N
+  channels and switches the rest off, so an account is never left in a state its
+  plan forbids.
+
+`channel_limit` and `monthly_mockup_limit` are denormalized onto each factory so
+these hot paths do not join. `plan.service.updatePlan` pushes new values out to
+every factory on that plan, so the copies cannot drift.
+
+### F. Webhook idempotency
+
+Stripe delivers at least once and retries on any non-2xx. Every handled event id
+is inserted into `subscription_events` with `ON CONFLICT DO NOTHING`; a duplicate
+delivery claims nothing and returns early. Handler failures deliberately return
+500 so Stripe retries — the ledger keeps that retry from double-applying.
+
+### G. API reference — billing
+
+| Method | Path | Auth | Purpose |
+| --- | --- | --- | --- |
+| `GET` | `/api/public/plans` | none | Live pricing catalog |
+| `GET` | `/api/public/username-available?username=` | none | Subdomain availability |
+| `POST` | `/api/public/register` | none | Self-serve signup, returns `checkoutUrl` |
+| `POST` | `/api/public/resume-checkout` | none | Re-open checkout for a `pending` factory |
+| `GET` | `/api/public/checkout-session?session_id=` | none | Confirm a completed checkout |
+| `POST` | `/api/billing/webhook` | Stripe signature | Subscription events (raw body) |
+| `GET` | `/api/billing` | Factory | Plan, usage, channels, invoices |
+| `POST` | `/api/billing/checkout` | Factory | Change plan, or open Checkout |
+| `POST` | `/api/billing/portal` | Factory | Stripe billing portal URL |
+| `POST` | `/api/billing/cancel` | Factory | Set/clear cancel-at-period-end |
+| `GET` / `PATCH` | `/api/billing/channels[/:channel]` | Factory | List / toggle channels |
+| `GET` / `POST` | `/api/admin/plans` | Admin | List / create plans |
+| `PATCH` / `DELETE` | `/api/admin/plans/:code` | Admin | Edit / delete a plan |
+| `POST` | `/api/admin/plans/:code/sync` | Admin | Re-sync a plan to Stripe |
+| `PATCH` | `/api/admin/factories/:id/plan` | Admin | Move a factory onto a plan |
+| `PATCH` | `/api/admin/factories/:id/status` | Admin | Change a factory's status |
+
+`POST /api/admin/factories` now **requires** a `plan`, and accepts an optional
+`interval`. No payment is taken; the plan is what sets the account's limits.
+
+> Deleting a plan is refused while any factory is on it (**409 `PLAN_IN_USE`**).
+> Deactivate it instead: it disappears from pricing while subscribers keep working.
+>
+> Admin plan changes bypass Stripe — right for a comp or a correction, wrong for
+> a real upgrade. Customers change their own plan from the billing page, which
+> does go through Stripe and prorates.

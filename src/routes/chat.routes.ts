@@ -7,6 +7,7 @@ import * as memoryController from "../controllers/chat-memory.controller";
 import * as productService from "../services/product.service";
 import { findProductById } from "../services/db.service";
 import { pool } from "../config/db";
+import * as subscriptions from "../services/subscription.service";
 
 const router = Router();
 
@@ -111,37 +112,12 @@ router.post("/quote/:id/reject", quoteController.rejectQuote);
 router.post("/mockup", mockupController.createMockup);
 router.post("/mockup/save", memoryController.saveMockupResult);
 // GET /api/chat/mockup/quota (Checks if factory has reached its monthly Mockup Generation limit)
+// The limit comes from the factory's subscription plan.
 router.get("/mockup/quota", async (req: ChatRequest, res: Response) => {
-  const client = await pool.connect();
   try {
-    // 1. Get factory monthly limit
-    const fResult = await client.query(
-      "SELECT monthly_mockup_limit FROM factories WHERE id = $1",
-      [req.factoryId]
-    );
-    const limit = fResult.rows[0]?.monthly_mockup_limit || 50;
-
-    // 2. Count how many mockups this factory generated this month
-    const countResult = await client.query(
-      `SELECT COUNT(*) as count FROM mockups 
-       WHERE factory_id = $1 
-         AND created_at >= date_trunc('month', CURRENT_DATE)`,
-      [req.factoryId]
-    );
-    const used = parseInt(countResult.rows[0].count);
-
-    // 3. Return quota status
-    const allowed = used < limit;
-    res.json({
-      allowed,
-      used,
-      limit,
-      remaining: Math.max(0, limit - used)
-    });
+    res.json(await subscriptions.checkMockupQuota(req.factoryId!));
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
-  } finally {
-    client.release();
   }
 });
 export default router;

@@ -12,6 +12,9 @@ import orderRoutes from "./routes/order.routes";
 import settingsRoutes from "./routes/settings.routes";
 import dashboardRoutes from "./routes/dashboard.routes";
 import inboxRoutes from "./routes/inbox.routes";
+import billingRoutes from "./routes/billing.routes";
+import registrationRoutes from "./routes/registration.routes";
+import * as billingController from "./controllers/billing.controller";
 
 const app = express();
 
@@ -21,6 +24,15 @@ app.use(
     origin: true, // Allows Vercel, localhost:3000, and local preview tests without CORS blocks!
     credentials: true,
   })
+);
+
+// Stripe's webhook must see the exact bytes Stripe signed, so it is mounted
+// with a raw body parser BEFORE express.json() -- parsing and reserializing the
+// JSON changes the payload and the signature check then fails.
+app.post(
+  "/api/billing/webhook",
+  express.raw({ type: "application/json" }),
+  billingController.webhook
 );
 
 // Allow photos up to 25MB (Prevents "Payload Too Large" errors!)
@@ -43,6 +55,9 @@ app.use("/api/orders", orderRoutes);
 app.use("/api/settings", settingsRoutes);
 app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/inbox", inboxRoutes);
+app.use("/api/billing", billingRoutes);
+// Public: the pricing catalog, subdomain availability and self-serve signup.
+app.use("/api/public", registrationRoutes);
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found" });
 });

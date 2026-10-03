@@ -1,10 +1,11 @@
 import { Router } from "express";
 import * as customerController from "../controllers/customer.controller";
 import { authMiddleware, factoryMiddleware } from "../middleware/auth.middleware";
+import { requireActiveSubscription } from "../middleware/subscription.middleware";
 
 const router = Router();
 
-router.use(authMiddleware, factoryMiddleware);
+router.use(authMiddleware, factoryMiddleware, requireActiveSubscription);
 
 router.get("/", customerController.listCustomers);
 router.get("/:id", customerController.getCustomer);

@@ -4,10 +4,11 @@ import {
   authMiddleware,
   factoryMiddleware,
 } from "../middleware/auth.middleware";
+import { requireActiveSubscription } from "../middleware/subscription.middleware";
 
 const router = Router();
 
-router.use(authMiddleware, factoryMiddleware);
+router.use(authMiddleware, factoryMiddleware, requireActiveSubscription);
 
 router.get("/", productController.listProducts);
 router.get("/:id", productController.getProduct);
