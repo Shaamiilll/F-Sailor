@@ -15,6 +15,8 @@ import inboxRoutes from "./routes/inbox.routes";
 import billingRoutes from "./routes/billing.routes";
 import registrationRoutes from "./routes/registration.routes";
 import * as billingController from "./controllers/billing.controller";
+import whatsappRoutes from "./routes/whatsapp.routes";
+import * as whatsappController from "./controllers/whatsapp.controller";
 
 const app = express();
 
@@ -33,6 +35,15 @@ app.post(
   "/api/billing/webhook",
   express.raw({ type: "application/json" }),
   billingController.webhook
+);
+
+// Meta signs the WhatsApp webhook body too, so it also needs the raw bytes.
+// GET is the subscription handshake and carries no body.
+app.get("/api/whatsapp/webhook", whatsappController.verifyWebhook);
+app.post(
+  "/api/whatsapp/webhook",
+  express.raw({ type: "application/json" }),
+  whatsappController.receiveWebhook
 );
 
 // Allow photos up to 25MB (Prevents "Payload Too Large" errors!)
@@ -56,6 +67,7 @@ app.use("/api/settings", settingsRoutes);
 app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/inbox", inboxRoutes);
 app.use("/api/billing", billingRoutes);
+app.use("/api/whatsapp", whatsappRoutes);
 // Public: the pricing catalog, subdomain availability and self-serve signup.
 app.use("/api/public", registrationRoutes);
 app.use((_req, res) => {

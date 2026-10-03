@@ -10,7 +10,8 @@
     "db:migrate": "tsx src/db/migrate-commerce.ts",
     "db:migrate:billing": "tsx src/db/migrate-billing.ts",
     "db:migrate:paddle": "tsx src/db/migrate-paddle.ts",
-    "paddle:sync": "tsx src/scripts/paddle-sync.ts"
+    "paddle:sync": "tsx src/scripts/paddle-sync.ts",
+    "db:migrate:whatsapp": "tsx src/db/migrate-whatsapp.ts"
   },
   "dependencies": {
     "@google/genai": "^2.21.0",

@@ -522,3 +522,137 @@ Consequences for the current catalog:
 > Admin plan changes bypass Paddle — right for a comp or a correction, wrong for
 > a real upgrade. Customers change their own plan from the billing page, which
 > does go through Paddle and prorates.
+
+---
+
+## 8. WhatsApp Business Automation
+
+A factory connects its own Meta WhatsApp number from **Dashboard → Configure**.
+Buyers message that number and get an immediate reply composed from the
+factory's own product catalog.
+
+### A. What it reuses
+
+Deliberately **not** a new message store. Inbound and outbound messages are
+written to the existing `chat_sessions` / `chat_messages` tables with an
+`external_user_id` of `whatsapp:<phone>`, which `inbox.service.detectChannel`
+already classifies as WhatsApp. So WhatsApp threads appear in the Conversations
+inbox next to web chat, and leads flow into `leads` as they always did.
+
+`whatsapp_conversations` exists for a different reason: Meta bills and
+rate-limits per **24-hour conversation window**, not per message, and the free
+tier is **1,000 service conversations a month**. One row per window is what
+makes that countable — that is the "1000 chats" the configure page reports.
+
+### B. Tables
+
+| Table | Purpose |
+| --- | --- |
+| `whatsapp_configs` | One row per factory: Meta credentials and all automation settings. |
+| `whatsapp_conversations` | One row per 24-hour window. Drives the monthly quota meter and the handover flag. |
+| `whatsapp_inbound_messages` | Just `wa_message_id`. Makes Meta's redeliveries no-ops. |
+
+Credentials (`access_token_encrypted`, `app_secret_encrypted`) are **AES-256-GCM
+encrypted at rest** via `crypto.service.ts`. GCM rather than CBC because it
+authenticates the ciphertext, so a tampered row fails to decrypt instead of
+yielding garbage we would then send to Meta. These values are never returned by
+the API — the dashboard only ever sees `EAAG••••x9Qd`.
+
+> Set `ENCRYPTION_KEY` (`openssl rand -hex 32`) in production. Without it the key
+> is derived from `JWT_SECRET`, which means rotating `JWT_SECRET` would make
+> every stored token undecryptable.
+
+### C. The automation loop
+
+```
+Meta -> POST /api/whatsapp/webhook   (raw body, X-Hub-Signature-256 verified)
+     -> 200 returned IMMEDIATELY, then processed async
+     -> claim wa_message_id (dedupe)
+     -> factory looked up by phone_number_id
+     -> lead + chat message recorded
+     -> conversation window found or opened
+     -> reply composed from the catalog
+     -> sent via Graph API, recorded as a bot message
+```
+
+The 200 is sent **before** processing because generating a reply involves a model
+call plus an outbound send, both far slower than Meta's webhook timeout — and a
+slow response makes Meta redeliver.
+
+Each stage can bail quietly, by design. This runs after the response is already
+committed, so an error must be logged, never thrown.
+
+Checks applied in order: auto-reply off → stop. Thread already handed to a human
+→ stop. Message contains a handover keyword → flag it, tell the buyer, stop.
+Outside business hours and an away message is set → send that, stop. First
+message of a new window and a greeting is set → send it. AI disabled → stop.
+
+### D. Reply quality
+
+`ai-reply.service.ts` builds the prompt from the factory's **active products**
+(capped at 40) and the last 12 turns. The system prompt forbids inventing a
+price, MOQ or lead time, forbids promising discounts, delivery dates or payment
+terms, and tells the model to reply in the buyer's language.
+
+That strictness is the point: a wrong MOQ quoted over WhatsApp is a commercial
+problem, not just a bad answer. If generation fails, the configured fallback is
+sent — or nothing at all, which is better than an error string, because the
+factory's team still sees the message in the inbox.
+
+Uses `@google/genai`, the model client this project already depended on.
+`GEMINI_API_KEY` is optional: without it messages are still captured and shown
+in Conversations, nothing is answered automatically, and the configure page says
+so.
+
+### E. Security boundaries
+
+- **Webhook signature** — HMAC-SHA256 over the raw body against the factory's
+  app secret. Checked before anything is parsed. Verification is opt-in: if no
+  factory has an app secret stored, webhooks are accepted, because a factory can
+  run the integration without sharing one and refusing everything would break the
+  feature rather than secure it. The configure page recommends setting it.
+- **Verify token** — generated per factory, compared in constant time. Meta's
+  handshake carries no tenant identifier, so all tokens are checked.
+- **Tenant isolation** — `phone_number_id` is UNIQUE, so an inbound message maps
+  to exactly one factory. The invoice-PDF and handover endpoints re-check
+  ownership rather than trusting an id from the client.
+- **Subscription gate** — a `canceled` or `suspended` factory's messages are
+  recorded but not answered, so a lapsed account cannot keep consuming WhatsApp
+  quota or AI budget.
+
+### F. Setup
+
+```bash
+npm run db:migrate:whatsapp
+
+# backend/.env
+PUBLIC_API_URL=https://your-api.example.com   # Meta must REACH this
+ENCRYPTION_KEY=                                # openssl rand -hex 32
+GEMINI_API_KEY=                                # optional; no key = no auto-replies
+```
+
+`PUBLIC_API_URL` is what the configure page shows the factory as their callback
+URL. **In development it must be a tunnel** (`ngrok http 4000`) — Meta cannot
+reach localhost, and the page warns when the URL still looks local.
+
+The factory then does the rest themselves on **Dashboard → Configure**: paste the
+callback URL and verify token into Meta, subscribe to the `messages` field, enter
+their phone number ID and a permanent System User access token, press **Test
+connection**, and configure the automation.
+
+### G. API reference — WhatsApp
+
+| Method | Path | Auth | Purpose |
+| --- | --- | --- | --- |
+| `GET` | `/api/whatsapp/webhook` | verify token | Meta subscription handshake |
+| `POST` | `/api/whatsapp/webhook` | Meta signature | Inbound messages (raw body) |
+| `GET` | `/api/whatsapp/config` | Factory | Config, usage, channel and AI availability |
+| `PATCH` | `/api/whatsapp/config` | Factory | Credentials and automation settings |
+| `POST` | `/api/whatsapp/verify` | Factory | Check credentials against Meta |
+| `POST` | `/api/whatsapp/disconnect` | Factory | Clear credentials |
+| `POST` | `/api/whatsapp/test` | Factory | Send a test message |
+| `PATCH` | `/api/whatsapp/conversations/:id/handover` | Factory | Hand a thread to/from a human |
+
+> A blank `accessToken` or `appSecret` in a PATCH **keeps the stored value**. The
+> client only ever holds a masked copy, so treating blank as "clear" would let a
+> save of unrelated settings destroy a working credential.

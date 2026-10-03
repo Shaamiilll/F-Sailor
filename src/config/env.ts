@@ -11,6 +11,16 @@ export const env = {
   adminPassword: "123",
   /** Apex domain factories get a subdomain under, e.g. "acme.kayanflow.com". */
   rootDomain: process.env.ROOT_DOMAIN || "localhost:3000",
+  /**
+   * This API's own public URL. Meta must be able to reach the WhatsApp webhook,
+   * so in development this is a tunnel (ngrok), not localhost.
+   */
+  publicApiUrl:
+    process.env.PUBLIC_API_URL || `http://localhost:${process.env.PORT || "4000"}`,
+  /** AES-256 key for stored third-party credentials (openssl rand -hex 32). */
+  encryptionKey: process.env.ENCRYPTION_KEY || "",
+  geminiApiKey: process.env.GEMINI_API_KEY || "",
+  geminiModel: process.env.GEMINI_MODEL || "gemini-2.0-flash",
   paddle: {
     apiKey: process.env.PADDLE_API_KEY || "",
     /** Secret for the notification destination that posts to our webhook. */

@@ -4,6 +4,7 @@ import { env } from "../config/env";
 import { commerceSchema } from "./migrate-commerce";
 import { billingSchema, seedPlans } from "./migrate-billing";
 import { paddleRenameSchema } from "./migrate-paddle";
+import { whatsappSchema } from "./migrate-whatsapp";
 
 const schema = `
 CREATE TABLE IF NOT EXISTS factories (
@@ -170,6 +171,8 @@ async function init() {
     await client.query(paddleRenameSchema);
     await client.query(billingSchema);
     await seedPlans(client);
+    // WhatsApp Business automation.
+    await client.query(whatsappSchema);
 
     const adminCheck = await client.query(
       "SELECT id FROM users WHERE email = $1",
