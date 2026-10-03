@@ -1,47 +1,47 @@
-import Stripe from "stripe";
+import type { EventEntity, Subscription, Transaction } from "@paddle/paddle-node-sdk";
 import { pool } from "../config/db";
 import { env } from "../config/env";
-import { billingEnabled, stripe, stripeDate } from "../config/stripe";
+import { billingEnabled, fromMinorUnits, paddle } from "../config/paddle";
 import { BillingInterval } from "../config/plans";
 import * as planService from "./plan.service";
 import * as subscriptions from "./subscription.service";
 
 /**
- * Everything that talks to Stripe about a *factory's* subscription. (Pushing
- * the price list itself into Stripe lives in plan.service.ts.)
+ * Everything that talks to Paddle about a *factory's* subscription. (Pushing
+ * the price list itself into Paddle lives in plan.service.ts.)
  *
  * The flow this backs is: a visitor registers (factory row created as
- * `pending`, subdomain reserved) -> they're sent to Stripe Checkout -> Stripe
- * calls our webhook -> the factory flips to `active` and can sign in.
+ * `pending`, subdomain reserved) -> we open a Paddle transaction and hand its
+ * id to the browser -> Paddle.js opens the checkout overlay -> Paddle calls our
+ * webhook -> the factory flips to `active` and can sign in.
  *
- * The webhook, not the browser redirect, is what grants access. A user can
- * close the tab before being redirected back, and a redirect URL can be forged;
- * a signed webhook can't be.
+ * Unlike a Stripe Checkout redirect, Paddle's checkout is rendered by Paddle.js
+ * in the page. We therefore return a transaction id, not a URL, and the
+ * frontend opens the overlay with it.
+ *
+ * The **webhook**, not the browser, is what grants access. A user can close the
+ * overlay before it reports success, and anything the browser sends can be
+ * forged; a signed webhook cannot.
  */
 
-export { BillingDisabledError } from "../config/stripe";
+export { BillingDisabledError } from "../config/paddle";
 
 /**
- * Maps a Stripe subscription status onto ours.
+ * Maps a Paddle subscription status onto ours.
  *
  * `trialing` counts as active so adding a trial later needs no change here.
- * `incomplete` means the first payment never succeeded, which for us is
- * indistinguishable from never having paid -- so it stays `pending`.
+ * `paused` means Paddle has stopped collecting, which for access purposes is
+ * the same as not having paid.
  */
-function statusFromStripe(
-  status: Stripe.Subscription.Status
-): subscriptions.FactoryStatus {
+function statusFromPaddle(status: Subscription["status"]): subscriptions.FactoryStatus {
   switch (status) {
     case "active":
     case "trialing":
       return "active";
     case "past_due":
-    case "unpaid":
       return "past_due";
     case "canceled":
-    case "incomplete_expired":
       return "canceled";
-    case "incomplete":
     case "paused":
     default:
       return "pending";
@@ -51,7 +51,7 @@ function statusFromStripe(
 async function getOrCreateCustomer(factoryId: string): Promise<string> {
   const existing = await subscriptions.getSubscription(factoryId);
   if (!existing) throw new Error("Factory not found");
-  if (existing.stripeCustomerId) return existing.stripeCustomerId;
+  if (existing.paddleCustomerId) return existing.paddleCustomerId;
 
   const factory = await pool.query(
     "SELECT name, email, username FROM factories WHERE id = $1",
@@ -60,72 +60,88 @@ async function getOrCreateCustomer(factoryId: string): Promise<string> {
   const row = factory.rows[0];
   if (!row) throw new Error("Factory not found");
 
-  const customer = await stripe().customers.create({
-    name: row.name,
-    email: row.email,
-    metadata: { factory_id: factoryId, username: row.username ?? "" },
-  });
+  const client = paddle();
+  let customerId: string;
 
-  await subscriptions.setStripeCustomer(factoryId, customer.id);
-  return customer.id;
+  try {
+    const customer = await client.customers.create({
+      email: row.email,
+      name: row.name,
+      customData: { factory_id: factoryId, username: row.username ?? "" },
+    });
+    customerId = customer.id;
+  } catch (err) {
+    // Paddle rejects a duplicate email outright, which happens whenever someone
+    // re-registers or we created the customer on an earlier attempt. Adopt the
+    // existing record instead of dead-ending the signup.
+    const existingCustomer = await findCustomerByEmail(row.email);
+    if (!existingCustomer) throw err;
+    customerId = existingCustomer;
+  }
+
+  await subscriptions.setPaddleCustomer(factoryId, customerId);
+  return customerId;
+}
+
+async function findCustomerByEmail(email: string): Promise<string | null> {
+  const page = paddle().customers.list({ email: [email] });
+  for await (const customer of page) {
+    return customer.id;
+  }
+  return null;
 }
 
 export interface CheckoutSessionResult {
-  url: string;
-  sessionId: string;
+  /** Paddle.js opens the overlay with this. There is no redirect URL. */
+  transactionId: string;
 }
 
 /**
- * Opens a Stripe Checkout session for a factory's subscription.
+ * Opens a Paddle transaction for a factory's subscription.
  *
- * `factory_id` rides along in both the session and the subscription metadata so
- * the webhook can match a payment back to the right account without trusting
- * anything the browser sends.
+ * `factory_id` rides along in the transaction's custom data so the webhook can
+ * match a payment back to the right account without trusting the browser.
  */
 export async function createCheckoutSession(
   factoryId: string,
   planCode: string,
   interval: BillingInterval
 ): Promise<CheckoutSessionResult> {
-  const priceId = await planService.stripePriceIdFor(planCode, interval);
+  const priceId = await planService.paddlePriceIdFor(planCode, interval);
   const customerId = await getOrCreateCustomer(factoryId);
 
-  const session = await stripe().checkout.sessions.create({
-    mode: "subscription",
-    customer: customerId,
-    line_items: [{ price: priceId, quantity: 1 }],
-    client_reference_id: factoryId,
-    metadata: { factory_id: factoryId, plan: planCode, interval },
-    subscription_data: {
-      metadata: { factory_id: factoryId, plan: planCode, interval },
-    },
-    allow_promotion_codes: true,
-    billing_address_collection: "auto",
-    success_url: `${env.frontendUrl}/register/success?session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${env.frontendUrl}/register/cancelled?factory=${factoryId}`,
+  const transaction = await paddle().transactions.create({
+    items: [{ priceId, quantity: 1 }],
+    customerId,
+    customData: { factory_id: factoryId, plan: planCode, interval },
+    checkout: { url: `${env.frontendUrl}/register/success` },
   });
 
-  if (!session.url) throw new Error("Stripe did not return a checkout URL");
-  return { url: session.url, sessionId: session.id };
+  return { transactionId: transaction.id };
 }
 
-/** The Stripe-hosted page where a customer updates their card or cancels. */
-export async function createPortalSession(
-  factoryId: string,
-  returnPath = "/dashboard/billing"
-): Promise<string> {
-  const customerId = await getOrCreateCustomer(factoryId);
-  const session = await stripe().billingPortal.sessions.create({
-    customer: customerId,
-    return_url: `${env.frontendUrl}${returnPath}`,
-  });
-  return session.url;
+/**
+ * A Paddle-hosted page where a customer updates their payment method or
+ * cancels. Scoped to their subscription when they have one.
+ */
+export async function createPortalSession(factoryId: string): Promise<string> {
+  const current = await subscriptions.getSubscription(factoryId);
+  if (!current?.paddleCustomerId) {
+    throw new Error("This factory has no billing account yet");
+  }
+
+  const session = await paddle().customerPortalSessions.create(
+    current.paddleCustomerId,
+    current.paddleSubscriptionId ? [current.paddleSubscriptionId] : []
+  );
+
+  return session.urls.general.overview;
 }
 
 /**
  * Switches an existing subscription to a different plan or interval, with
- * Stripe prorating the difference. A factory with no subscription yet goes
- * through Checkout instead.
+ * Paddle prorating the difference. A factory with no subscription yet goes
+ * through checkout instead.
  */
 export async function changePlan(
   factoryId: string,
@@ -135,25 +151,20 @@ export async function changePlan(
   const current = await subscriptions.getSubscription(factoryId);
   if (!current) throw new Error("Factory not found");
 
-  if (!current.stripeSubscriptionId) {
+  if (!current.paddleSubscriptionId) {
     return createCheckoutSession(factoryId, planCode, interval);
   }
 
-  const priceId = await planService.stripePriceIdFor(planCode, interval);
-  const subscription = await stripe().subscriptions.retrieve(
-    current.stripeSubscriptionId
-  );
-  const item = subscription.items.data[0];
-  if (!item) throw new Error("Subscription has no line item to update");
+  const priceId = await planService.paddlePriceIdFor(planCode, interval);
 
-  await stripe().subscriptions.update(current.stripeSubscriptionId, {
-    items: [{ id: item.id, price: priceId }],
-    proration_behavior: "create_prorations",
-    metadata: { factory_id: factoryId, plan: planCode, interval },
+  await paddle().subscriptions.update(current.paddleSubscriptionId, {
+    items: [{ priceId, quantity: 1 }],
+    prorationBillingMode: "prorated_immediately",
+    customData: { factory_id: factoryId, plan: planCode, interval },
   });
 
   // Reflect it immediately so the dashboard doesn't show a stale plan while we
-  // wait for `customer.subscription.updated` to arrive.
+  // wait for `subscription.updated` to arrive.
   await subscriptions.applyPlan(factoryId, planCode, interval);
   return { changed: true };
 }
@@ -164,12 +175,24 @@ export async function cancelAtPeriodEnd(
   cancel: boolean
 ): Promise<void> {
   const current = await subscriptions.getSubscription(factoryId);
-  if (!current?.stripeSubscriptionId) {
+  if (!current?.paddleSubscriptionId) {
     throw new Error("This factory has no active subscription");
   }
-  await stripe().subscriptions.update(current.stripeSubscriptionId, {
-    cancel_at_period_end: cancel,
-  });
+
+  const client = paddle();
+
+  if (cancel) {
+    await client.subscriptions.cancel(current.paddleSubscriptionId, {
+      effectiveFrom: "next_billing_period",
+    });
+  } else {
+    // Clearing a scheduled cancellation is what Paddle calls removing the
+    // scheduled change; there is no "uncancel" verb.
+    await client.subscriptions.update(current.paddleSubscriptionId, {
+      scheduledChange: null,
+    });
+  }
+
   await pool.query("UPDATE factories SET cancel_at_period_end = $2 WHERE id = $1", [
     factoryId,
     cancel,
@@ -189,49 +212,75 @@ export interface InvoiceSummary {
 
 export async function listInvoices(factoryId: string): Promise<InvoiceSummary[]> {
   const current = await subscriptions.getSubscription(factoryId);
-  if (!current?.stripeCustomerId) return [];
+  if (!current?.paddleCustomerId) return [];
 
-  const invoices = await stripe().invoices.list({
-    customer: current.stripeCustomerId,
-    limit: 24,
+  const client = paddle();
+  const page = client.transactions.list({
+    customerId: [current.paddleCustomerId],
+    perPage: 24,
   });
 
-  return invoices.data.map((invoice) => ({
-    id: invoice.id ?? "",
-    number: invoice.number ?? null,
-    amountPaid: (invoice.amount_paid ?? 0) / 100,
-    currency: (invoice.currency ?? "usd").toUpperCase(),
-    status: invoice.status ?? null,
-    createdAt: new Date((invoice.created ?? 0) * 1000).toISOString(),
-    invoiceUrl: invoice.hosted_invoice_url ?? null,
-    pdfUrl: invoice.invoice_pdf ?? null,
-  }));
+  const invoices: InvoiceSummary[] = [];
+  for await (const transaction of page) {
+    invoices.push({
+      id: transaction.id,
+      number: transaction.invoiceNumber ?? null,
+      amountPaid: fromMinorUnits(transaction.details?.totals?.grandTotal),
+      currency: transaction.currencyCode ?? "USD",
+      status: transaction.status ?? null,
+      createdAt: transaction.billedAt ?? transaction.createdAt,
+      // Paddle serves invoice PDFs through a short-lived signed link, fetched
+      // on demand rather than stored.
+      invoiceUrl: null,
+      pdfUrl: null,
+    });
+    if (invoices.length >= 24) break;
+  }
+
+  return invoices;
+}
+
+/** A fresh, short-lived link to one invoice PDF. */
+export async function getInvoicePdfUrl(
+  factoryId: string,
+  transactionId: string
+): Promise<string> {
+  const current = await subscriptions.getSubscription(factoryId);
+  if (!current?.paddleCustomerId) throw new Error("No billing account");
+
+  const transaction = await paddle().transactions.get(transactionId);
+  // Scope the lookup to this factory: a transaction id alone must not expose
+  // another tenant's invoice.
+  if (transaction.customerId !== current.paddleCustomerId) {
+    throw new Error("Invoice not found");
+  }
+
+  const pdf = await paddle().transactions.getInvoicePDF(transactionId);
+  return pdf.url;
 }
 
 /**
- * Reads a completed Checkout session so the success page can confirm what the
- * visitor just bought -- and, if the webhook hasn't landed yet, activate the
- * factory from the session itself. The session id is only obtainable by
- * finishing checkout, and we re-fetch it from Stripe rather than trusting the
- * query string, so this is a safe fallback rather than a bypass.
+ * Reads a transaction so the success page can confirm the payment landed -- and,
+ * if the webhook hasn't arrived yet, activate the factory from the transaction
+ * itself. The id is re-fetched from Paddle rather than trusted from the query
+ * string, so this is a safe fallback rather than a bypass.
  */
-export async function resolveCheckoutSession(sessionId: string): Promise<{
+export async function resolveCheckoutSession(transactionId: string): Promise<{
   status: string;
   paid: boolean;
   factory: { id: string; name: string; username: string | null; email: string } | null;
   plan: string | null;
   interval: BillingInterval | null;
 }> {
-  const session = await stripe().checkout.sessions.retrieve(sessionId, {
-    expand: ["subscription"],
-  });
+  const transaction = await paddle().transactions.get(transactionId);
 
-  const factoryId = session.metadata?.factory_id ?? session.client_reference_id ?? null;
-  const paid = session.payment_status === "paid" || session.status === "complete";
+  const custom = (transaction.customData ?? {}) as Record<string, string>;
+  const factoryId = custom.factory_id ?? null;
+  const paid = transaction.status === "completed" || transaction.status === "paid";
 
   if (!factoryId) {
     return {
-      status: session.status ?? "unknown",
+      status: transaction.status,
       paid,
       factory: null,
       plan: null,
@@ -239,7 +288,7 @@ export async function resolveCheckoutSession(sessionId: string): Promise<{
     };
   }
 
-  if (paid) await activateFromSession(session, factoryId);
+  if (paid) await activateFromTransaction(transaction, factoryId);
 
   const result = await pool.query(
     "SELECT id, name, username, email, plan, billing_interval FROM factories WHERE id = $1",
@@ -248,7 +297,7 @@ export async function resolveCheckoutSession(sessionId: string): Promise<{
   const row = result.rows[0];
 
   return {
-    status: session.status ?? "unknown",
+    status: transaction.status,
     paid,
     factory: row
       ? { id: row.id, name: row.name, username: row.username, email: row.email }
@@ -258,34 +307,29 @@ export async function resolveCheckoutSession(sessionId: string): Promise<{
   };
 }
 
-async function activateFromSession(
-  session: Stripe.Checkout.Session,
+async function activateFromTransaction(
+  transaction: Transaction,
   factoryId: string
 ): Promise<void> {
-  const planCode = session.metadata?.plan || "starter";
-  const interval = (session.metadata?.interval as BillingInterval) || "monthly";
-
-  const subscriptionId =
-    typeof session.subscription === "string"
-      ? session.subscription
-      : session.subscription?.id ?? null;
+  const custom = (transaction.customData ?? {}) as Record<string, string>;
+  const planCode = custom.plan || "starter";
+  const interval = (custom.interval as BillingInterval) || "monthly";
 
   let periodEnd: Date | null = null;
   let cancelAtEnd = false;
 
-  if (subscriptionId) {
-    const sub = await stripe().subscriptions.retrieve(subscriptionId);
-    periodEnd = stripeDate(sub.items.data[0]?.current_period_end);
-    cancelAtEnd = Boolean(sub.cancel_at_period_end);
+  if (transaction.subscriptionId) {
+    const sub = await paddle().subscriptions.get(transaction.subscriptionId);
+    periodEnd = sub.currentBillingPeriod?.endsAt
+      ? new Date(sub.currentBillingPeriod.endsAt)
+      : null;
+    cancelAtEnd = sub.scheduledChange?.action === "cancel";
   }
 
   await subscriptions.applyPlan(factoryId, planCode, interval, {
     status: "active",
-    stripeCustomerId:
-      typeof session.customer === "string"
-        ? session.customer
-        : session.customer?.id ?? null,
-    stripeSubscriptionId: subscriptionId,
+    paddleCustomerId: transaction.customerId ?? null,
+    paddleSubscriptionId: transaction.subscriptionId ?? null,
     currentPeriodEnd: periodEnd,
     cancelAtPeriodEnd: cancelAtEnd,
   });
@@ -293,144 +337,152 @@ async function activateFromSession(
 
 // --- Webhooks ----------------------------------------------------------------
 
-export function constructWebhookEvent(rawBody: Buffer, signature: string): Stripe.Event {
-  if (!env.stripe.webhookSecret) {
-    throw new Error("STRIPE_WEBHOOK_SECRET is not set");
+/**
+ * Verifies Paddle's signature and parses the event.
+ *
+ * `rawBody` must be the exact bytes Paddle signed -- see the raw body parser
+ * mounted ahead of express.json() in index.ts.
+ */
+export async function constructWebhookEvent(
+  rawBody: Buffer,
+  signature: string
+): Promise<EventEntity> {
+  if (!env.paddle.webhookSecret) {
+    throw new Error("PADDLE_WEBHOOK_SECRET is not set");
   }
-  return stripe().webhooks.constructEvent(rawBody, signature, env.stripe.webhookSecret);
+  const event = await paddle().webhooks.unmarshal(
+    rawBody.toString("utf8"),
+    env.paddle.webhookSecret,
+    signature
+  );
+  if (!event) throw new Error("Invalid Paddle signature");
+  return event;
 }
 
 /**
- * Records the event id first and bails if we've seen it before. Stripe retries
- * on any non-2xx and can deliver the same event more than once, so without this
- * a retry could re-apply a plan change the customer has since reversed.
+ * Records the event id first and bails if we've seen it before. Paddle delivers
+ * at least once and retries on failure, so without this a retry could re-apply
+ * a plan change the customer has since reversed.
  */
 async function claimEvent(
-  event: Stripe.Event,
-  factoryId: string | null
+  eventId: string,
+  type: string,
+  factoryId: string | null,
+  payload: unknown
 ): Promise<boolean> {
   const result = await pool.query(
-    `INSERT INTO subscription_events (stripe_event_id, type, factory_id, payload)
+    `INSERT INTO subscription_events (provider_event_id, type, factory_id, payload)
      VALUES ($1, $2, $3, $4)
-     ON CONFLICT (stripe_event_id) DO NOTHING
+     ON CONFLICT (provider_event_id) DO NOTHING
      RETURNING id`,
-    [event.id, event.type, factoryId, JSON.stringify(event.data.object)]
+    [eventId, type, factoryId, JSON.stringify(payload)]
   );
   return (result.rowCount ?? 0) > 0;
 }
 
-async function factoryIdForSubscription(
-  sub: Stripe.Subscription
-): Promise<string | null> {
-  if (sub.metadata?.factory_id) return sub.metadata.factory_id;
+async function factoryIdForSubscription(sub: Subscription): Promise<string | null> {
+  const custom = (sub.customData ?? {}) as Record<string, string>;
+  if (custom.factory_id) return custom.factory_id;
 
-  const bySubscription = await subscriptions.findByStripeSubscription(sub.id);
+  const bySubscription = await subscriptions.findByPaddleSubscription(sub.id);
   if (bySubscription) return bySubscription.factoryId;
 
-  const customerId = typeof sub.customer === "string" ? sub.customer : sub.customer.id;
-  const byCustomer = await subscriptions.findByStripeCustomer(customerId);
+  const byCustomer = await subscriptions.findByPaddleCustomer(sub.customerId);
   return byCustomer?.factoryId ?? null;
 }
 
-async function syncSubscription(sub: Stripe.Subscription): Promise<void> {
+async function syncSubscription(sub: Subscription): Promise<void> {
   const factoryId = await factoryIdForSubscription(sub);
   if (!factoryId) {
-    console.warn(`[billing] No factory matches Stripe subscription ${sub.id}`);
+    console.warn(`[billing] No factory matches Paddle subscription ${sub.id}`);
     return;
   }
 
-  const priceId = sub.items.data[0]?.price?.id ?? "";
-  const resolved = priceId ? await planService.findPlanByStripePriceId(priceId) : null;
+  const priceId = sub.items?.[0]?.price?.id ?? "";
+  const resolved = priceId ? await planService.findPlanByPaddlePriceId(priceId) : null;
 
-  // An unrecognised price means the subscription was pointed at something this
-  // catalog doesn't know -- an archived price, or one created in the Stripe
-  // dashboard. Keep the stored plan rather than guessing, but still sync
-  // status and dates so access and renewal stay correct.
-  const planCode = resolved?.plan.code ?? sub.metadata?.plan ?? null;
-  const interval =
-    resolved?.interval ?? (sub.metadata?.interval as BillingInterval) ?? null;
+  const custom = (sub.customData ?? {}) as Record<string, string>;
 
-  const status = statusFromStripe(sub.status);
-  const periodEnd = stripeDate(sub.items.data[0]?.current_period_end);
+  // An unrecognised price means the subscription points at something this
+  // catalog doesn't know -- an archived price, or one made in the Paddle
+  // dashboard. Keep the stored plan rather than guessing, but still sync status
+  // and dates so access and renewal stay correct.
+  const planCode = resolved?.plan.code ?? custom.plan ?? null;
+  const interval = resolved?.interval ?? (custom.interval as BillingInterval) ?? null;
+
+  const status = statusFromPaddle(sub.status);
+  const periodEnd = sub.currentBillingPeriod?.endsAt
+    ? new Date(sub.currentBillingPeriod.endsAt)
+    : null;
+  const cancelAtEnd = sub.scheduledChange?.action === "cancel";
+
   const planExists = planCode ? Boolean(await planService.findPlan(planCode)) : false;
 
   if (planCode && interval && planExists) {
     await subscriptions.applyPlan(factoryId, planCode, interval, {
       status,
-      stripeSubscriptionId: sub.id,
+      paddleCustomerId: sub.customerId,
+      paddleSubscriptionId: sub.id,
       currentPeriodEnd: periodEnd,
-      cancelAtPeriodEnd: Boolean(sub.cancel_at_period_end),
+      cancelAtPeriodEnd: cancelAtEnd,
     });
   } else {
     await pool.query(
       `UPDATE factories SET
          status = $2,
-         stripe_subscription_id = $3,
+         paddle_subscription_id = $3,
          current_period_end = COALESCE($4, current_period_end),
          cancel_at_period_end = $5
        WHERE id = $1`,
-      [factoryId, status, sub.id, periodEnd, Boolean(sub.cancel_at_period_end)]
+      [factoryId, status, sub.id, periodEnd, cancelAtEnd]
     );
   }
 }
 
-export async function handleWebhookEvent(event: Stripe.Event): Promise<void> {
-  switch (event.type) {
-    case "checkout.session.completed": {
-      const session = event.data.object as Stripe.Checkout.Session;
-      const factoryId =
-        session.metadata?.factory_id ?? session.client_reference_id ?? null;
+export async function handleWebhookEvent(event: EventEntity): Promise<void> {
+  const type = event.eventType as string;
 
-      if (!(await claimEvent(event, factoryId))) return;
+  switch (type) {
+    case "transaction.completed":
+    case "transaction.paid": {
+      const transaction = event.data as Transaction;
+      const custom = (transaction.customData ?? {}) as Record<string, string>;
+      const factoryId = custom.factory_id ?? null;
+
+      if (!(await claimEvent(event.eventId, type, factoryId, transaction))) return;
       if (!factoryId) {
-        console.warn(
-          `[billing] checkout.session.completed with no factory_id: ${session.id}`
-        );
+        console.warn(`[billing] ${type} with no factory_id: ${transaction.id}`);
         return;
       }
-      await activateFromSession(session, factoryId);
-      console.log(`[billing] Factory ${factoryId} activated from checkout ${session.id}`);
+      await activateFromTransaction(transaction, factoryId);
+      console.log(`[billing] Factory ${factoryId} activated from ${transaction.id}`);
       return;
     }
 
-    case "customer.subscription.created":
-    case "customer.subscription.updated":
-    case "customer.subscription.deleted": {
-      const sub = event.data.object as Stripe.Subscription;
+    case "subscription.created":
+    case "subscription.updated":
+    case "subscription.activated":
+    case "subscription.canceled":
+    case "subscription.paused":
+    case "subscription.resumed": {
+      const sub = event.data as Subscription;
       const factoryId = await factoryIdForSubscription(sub);
-      if (!(await claimEvent(event, factoryId))) return;
+      if (!(await claimEvent(event.eventId, type, factoryId, sub))) return;
       await syncSubscription(sub);
       return;
     }
 
-    case "invoice.payment_failed": {
-      const invoice = event.data.object as Stripe.Invoice;
-      const customerId =
-        typeof invoice.customer === "string" ? invoice.customer : invoice.customer?.id;
-      const factory = customerId
-        ? await subscriptions.findByStripeCustomer(customerId)
+    case "transaction.payment_failed": {
+      const transaction = event.data as Transaction;
+      const factory = transaction.customerId
+        ? await subscriptions.findByPaddleCustomer(transaction.customerId)
         : null;
 
-      if (!(await claimEvent(event, factory?.factoryId ?? null))) return;
+      if (!(await claimEvent(event.eventId, type, factory?.factoryId ?? null, transaction)))
+        return;
       if (factory && factory.status === "active") {
         await subscriptions.setStatus(factory.factoryId, "past_due");
         console.log(`[billing] Factory ${factory.factoryId} marked past_due`);
-      }
-      return;
-    }
-
-    case "invoice.paid": {
-      const invoice = event.data.object as Stripe.Invoice;
-      const customerId =
-        typeof invoice.customer === "string" ? invoice.customer : invoice.customer?.id;
-      const factory = customerId
-        ? await subscriptions.findByStripeCustomer(customerId)
-        : null;
-
-      if (!(await claimEvent(event, factory?.factoryId ?? null))) return;
-      if (factory && factory.status === "past_due") {
-        await subscriptions.setStatus(factory.factoryId, "active");
-        console.log(`[billing] Factory ${factory.factoryId} recovered to active`);
       }
       return;
     }
@@ -463,7 +515,7 @@ export async function getBillingOverview(factoryId: string) {
     provisionedBy: overview.subscription.provisionedBy,
     currentPeriodEnd: overview.subscription.currentPeriodEnd,
     cancelAtPeriodEnd: overview.subscription.cancelAtPeriodEnd,
-    hasSubscription: Boolean(overview.subscription.stripeSubscriptionId),
+    hasSubscription: Boolean(overview.subscription.paddleSubscriptionId),
     billingEnabled,
     usage: overview.usage,
     channels: overview.channels,

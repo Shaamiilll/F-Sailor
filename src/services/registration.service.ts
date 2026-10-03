@@ -14,7 +14,10 @@ import * as subscriptions from "./subscription.service";
  * account can't use the product. Stripe's webhook is what flips it to active.
  */
 
-const USERNAME_REGEX = /^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])?$/;
+// 3-32 chars: a leading and trailing alphanumeric with 1-30 in between. The
+// middle section is NOT optional -- making it so would let a single character
+// through, contradicting the rule the error message states.
+const USERNAME_REGEX = /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/;
 
 /**
  * Subdomains the platform needs for itself, plus the usual infrastructure
@@ -148,16 +151,16 @@ export interface RegisterResult {
     interval: BillingInterval;
     status: subscriptions.FactoryStatus;
   };
-  checkoutUrl: string;
+  transactionId: string;
 }
 
 /**
- * Creates the pending factory and returns the Stripe Checkout URL to send the
- * visitor to.
+ * Creates the pending factory and returns the Paddle transaction id the browser
+ * opens the checkout overlay with.
  *
- * If Stripe refuses the checkout session, the factory and user rows are rolled
- * back: leaving a pending account behind would hold the subdomain hostage with
- * no way for the visitor to ever pay for it.
+ * If Paddle refuses to open the transaction, the factory and user rows are
+ * rolled back: leaving a pending account behind would hold the subdomain
+ * hostage with no way for the visitor to ever pay for it.
  */
 export async function register(input: RegisterInput): Promise<RegisterResult> {
   const name = String(input.factoryName ?? "").trim();
@@ -236,10 +239,10 @@ export async function register(input: RegisterInput): Promise<RegisterResult> {
         interval,
         status: stored?.status ?? "pending",
       },
-      checkoutUrl: session.url,
+      transactionId: session.transactionId,
     };
   } catch (err) {
-    // No checkout means no way to pay -- don't squat on the subdomain.
+    // No transaction means no way to pay -- don't squat on the subdomain.
     await pool
       .query("DELETE FROM factories WHERE id = $1", [factoryId])
       .catch((cleanupErr) =>
@@ -254,7 +257,7 @@ export async function register(input: RegisterInput): Promise<RegisterResult> {
 
 /**
  * Re-opens checkout for a factory that registered but never paid, so a visitor
- * who abandoned the Stripe page can finish from the login screen.
+ * who abandoned the overlay can finish from the login screen.
  */
 export async function resumeCheckout(
   factoryId: string,
@@ -272,7 +275,7 @@ export async function resumeCheckout(
     plan ?? current.plan,
     interval ?? current.interval
   );
-  return session.url;
+  return session.transactionId;
 }
 
 /** Turns Postgres unique-violation noise into a message a visitor can act on. */

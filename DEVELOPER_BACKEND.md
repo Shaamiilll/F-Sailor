@@ -298,13 +298,31 @@ as "Unknown customer".
 
 ---
 
-## 7. SaaS Billing: Self-Serve Signup, Plans & Stripe
+
+---
+
+## 7. SaaS Billing: Self-Serve Signup, Plans & Paddle
 
 The platform is self-serve. A visitor creates their own factory from the public
-site, pays through Stripe, and their subdomain goes live — no admin involved.
+site, pays through Paddle, and their subdomain goes live — no admin involved.
 An admin can still provision a factory directly, which takes no payment.
 
-### A. The plan catalog is data, not code
+### A. Why Paddle, not Stripe
+
+Paddle is a **Merchant of Record**: it sells to the customer, handles global
+sales tax and VAT, and pays us out. Two things forced the move:
+
+1. **Cross-border.** Our Stripe account could not charge overseas buyers at all
+   (`This account isn't enabled to make cross border transactions`), which is
+   fatal for a product sold to export factories worldwide. As MoR, Paddle is the
+   seller of record, so this restriction does not apply.
+2. **China.** Paddle can offer **Alipay** and **WeChat Pay** without a Chinese
+   entity or merchant account. Stripe could not serve these buyers.
+
+See the limits in section H before pricing for Chinese customers — they are
+real and they constrain plan design.
+
+### B. The plan catalog is data, not code
 
 Plans live in the `plans` table and are managed from the admin panel
 (**Admin → Plans & pricing**). Prices, channel limits, mockup allowances and
@@ -318,14 +336,20 @@ reading them would make an admin's edits invisible.
 | Column | Meaning |
 | --- | --- |
 | `code` | Stable identifier stored on `factories.plan`. Immutable once set. |
-| `monthly_price` / `annual_price` | USD. `0` for an interval means that interval is not sold. |
+| `monthly_price` / `annual_price` | `0` for an interval means that interval is not sold. |
 | `channel_limit` | How many sales channels may be active at once. |
 | `monthly_mockup_limit` | AI logo mockups allowed per calendar month. |
 | `features` | JSONB array of strings, rendered on the pricing page. |
 | `active` | `false` hides it from pricing while existing subscribers keep working. |
-| `stripe_product_id`, `stripe_*_price_id` | Written by the Stripe sync. |
+| `paddle_product_id`, `paddle_*_price_id` | Written by the Paddle sync. |
 
-### B. Factory lifecycle
+Unlike Stripe, **Paddle prices are mutable**, so changing an amount updates the
+price in place rather than creating a replacement. Paddle keeps billing current
+subscribers at the amount they signed up for until their subscription is
+explicitly changed, so editing the public price list still never re-bills an
+existing customer.
+
+### C. Factory lifecycle
 
 `factories.status` gates access:
 
@@ -333,11 +357,11 @@ reading them would make an admin's edits invisible.
 | --- | --- | --- |
 | `pending` | no (402) | Registered, subdomain reserved, has not paid. |
 | `active` | yes | Paid, or admin-provisioned. |
-| `past_due` | yes | Card failed. Kept in with a banner — a lapsed card should not lock a factory out of its own data. |
+| `past_due` | yes | Payment failed. Kept in with a banner — a lapsed card should not lock a factory out of its own data. |
 | `canceled` | no (402) | Subscription ended. Data retained, access not. |
 | `suspended` | no (402) | Switched off by an admin. |
 
-`provisioned_by` is `self_serve` or `admin`. An `admin` factory has no Stripe
+`provisioned_by` is `self_serve` or `admin`. An `admin` factory has no Paddle
 subscription by design and is never chased for payment.
 
 `requireActiveSubscription` (`src/middleware/subscription.middleware.ts`) guards
@@ -346,63 +370,79 @@ keeps the session and routes to checkout instead of logging the user out.
 `/api/billing/*` is deliberately *not* behind it — that is the one area a lapsed
 account needs in order to start paying again.
 
-### C. Signup flow
+### D. Signup flow
 
 ```
 POST /api/public/register
   -> factory row created as `pending`, subdomain reserved, website channel seeded
-  -> Stripe Checkout session created (factory_id in metadata)
-  -> { factory, checkoutUrl }
+  -> Paddle customer + transaction created (factory_id in customData)
+  -> { factory, transactionId }
 
-browser -> Stripe Checkout -> payment
+browser -> Paddle.js opens the checkout OVERLAY with that transactionId
 
-Stripe -> POST /api/billing/webhook (checkout.session.completed)
+Paddle -> POST /api/billing/webhook (transaction.completed)
   -> factory flips to `active`
 ```
 
-The **webhook**, not the browser redirect, grants access: a user can close the
-tab before redirecting back, and a redirect URL can be forged — a signed webhook
-cannot be. The success page additionally re-reads the session *from Stripe* as a
-fallback for when the webhook is slow, which is safe because the session is
-re-fetched rather than trusted from the query string.
+**This differs from Stripe in shape, not just in vendor.** Stripe redirected to a
+hosted checkout URL; Paddle renders checkout as an overlay in our own page. So
+the backend returns a **transaction id, not a URL**, and the frontend opens the
+overlay with it. Any code expecting `checkoutUrl` is pre-Paddle.
 
-If Stripe refuses to open checkout, the factory and user rows are rolled back —
-otherwise an unpayable `pending` account would squat on the subdomain forever.
+The **webhook**, not the browser, grants access: a user can close the overlay
+before it reports success, and anything the browser sends can be forged — a
+signed webhook cannot. The success page additionally re-reads the transaction
+*from Paddle* as a fallback for when the webhook is slow, which is safe because
+the transaction is re-fetched rather than trusted from the query string.
 
-### D. Setup
+If Paddle refuses to open the transaction, the factory and user rows are rolled
+back — otherwise an unpayable `pending` account would squat on the subdomain
+forever.
+
+### E. Setup
 
 ```bash
-# 1. Apply the billing schema and seed the three default plans.
-#    Idempotent: re-running never re-seeds or re-promotes anyone.
-npm run db:migrate:billing
+# 1. Apply the schema. On a database that ran the Stripe-era migration this
+#    renames stripe_* columns to paddle_* and clears the old ids, so no data
+#    is lost. Idempotent.
+npm run db:migrate:paddle
 
-# 2. Add your Stripe test key to backend/.env
-#    STRIPE_SECRET_KEY=sk_test_...
+# 2. backend/.env
+#    PADDLE_API_KEY=pdl_sdbx_apikey_...
+#    PADDLE_ENVIRONMENT=sandbox
+#
+#    Frontend/.env.local
+#    NEXT_PUBLIC_PADDLE_CLIENT_TOKEN=test_...
+#    NEXT_PUBLIC_PADDLE_ENVIRONMENT=sandbox
 
-# 3. Push the plan catalog into Stripe (creates products + prices,
-#    writes the ids back onto each plan row).
-npm run stripe:sync
+# 3. Push the plan catalog into Paddle.
+npm run paddle:sync
 
-# 4. Forward webhooks locally, then copy the printed whsec_ into
-#    STRIPE_WEBHOOK_SECRET in backend/.env
-stripe listen --forward-to localhost:4000/api/billing/webhook
+# 4. Paddle Dashboard > Developer tools > Notifications > New destination
+#    URL: {public api}/api/billing/webhook
+#    Copy its secret into PADDLE_WEBHOOK_SECRET.
 ```
 
-There are **no price ids in `.env`** — each plan row carries its own, because an
-admin can create a plan at runtime. Saving a plan in the admin panel syncs it to
-Stripe automatically; `npm run stripe:sync` is for first setup, or for pointing
-an existing catalog at a new Stripe account.
+**Sandbox and production are separate Paddle accounts** with separate keys,
+client tokens and catalogs. Switching between them leaves every stored id
+pointing at something that does not exist; the sync detects that and recreates
+rather than failing, so a re-run is all that is needed.
 
-Without `STRIPE_SECRET_KEY` the server still boots: self-serve signup and the
+There are **no price ids in `.env`** — each plan row carries its own, because an
+admin can create a plan at runtime. Saving a plan in the admin panel syncs it
+automatically; `npm run paddle:sync` is for first setup or a change of account.
+
+> **Local webhooks:** Paddle has no equivalent of `stripe listen`. It must reach
+> a public URL, so tunnel the API (`ngrok http 4000`) and point the notification
+> destination at the tunnel. Without this the webhook never arrives and accounts
+> stay `pending` — though the success page's fallback read will still activate
+> them.
+
+Without `PADDLE_API_KEY` the server still boots: self-serve signup and the
 billing endpoints return a clear **503**, and an admin can provision factories
 by hand.
 
-**Migration note:** factories that predate billing are grandfathered onto the
-highest-priced plan with `status = 'active'` and `provisioned_by = 'admin'`, so
-nobody loses a capability they already had. This runs only on the first
-migration, detected by the absence of `factories.plan`.
-
-### E. Limit enforcement
+### F. Limit enforcement
 
 - **Mockups** — checked in `mockup.controller.createMockup` before generating
   (the expensive step), not only on the `/quota` endpoint, because the bot is
@@ -411,47 +451,74 @@ migration, detected by the absence of `factories.plan`.
   channels and refuses past the limit in one transaction, so two concurrent
   enables cannot both slip through. Returns **400 `PLAN_LIMIT`**.
 - **Downgrades** never fail. Dropping to a smaller plan keeps the oldest N
-  channels and switches the rest off, so an account is never left in a state its
-  plan forbids.
+  channels and switches the rest off.
 
 `channel_limit` and `monthly_mockup_limit` are denormalized onto each factory so
 these hot paths do not join. `plan.service.updatePlan` pushes new values out to
 every factory on that plan, so the copies cannot drift.
 
-### F. Webhook idempotency
+### G. Webhook idempotency
 
-Stripe delivers at least once and retries on any non-2xx. Every handled event id
-is inserted into `subscription_events` with `ON CONFLICT DO NOTHING`; a duplicate
-delivery claims nothing and returns early. Handler failures deliberately return
-500 so Stripe retries — the ledger keeps that retry from double-applying.
+Paddle delivers at least once and retries on failure. Every handled event id is
+inserted into `subscription_events.provider_event_id` with
+`ON CONFLICT DO NOTHING`; a duplicate delivery claims nothing and returns early.
+Handler failures deliberately return 500 so Paddle retries — the ledger keeps
+that retry from double-applying.
 
-### G. API reference — billing
+Signature verification uses the `Paddle-Signature` header and the **raw** body,
+which is why the webhook is mounted with `express.raw()` *before* `express.json()`
+in `index.ts`.
+
+### H. Chinese payment methods — read before pricing
+
+Paddle supports both, but with constraints that affect plan design:
+
+| | Subscriptions | Constraints |
+| --- | --- | --- |
+| **Alipay** | ✅ Yes | Needs separate Paddle approval. Only shown to customers with a **China address paying in CNY**. **Renewals must not exceed ¥1,600** or the payment fails. |
+| **WeChat Pay** | ❌ **One-time only** | Desktop only, China only, CNY/USD. Cannot back a recurring subscription. |
+
+Consequences for the current catalog:
+
+- **WeChat Pay cannot be used for any plan**, because every plan is a
+  subscription. Offering it would need one-time purchases (e.g. a prepaid year
+  sold as a single transaction) rather than a Paddle subscription.
+- The **¥1,600 renewal cap is roughly $220**. Monthly plans are comfortably
+  under it. **Annual plans are not**: Scale at $1,000/year is ≈¥7,100 and would
+  fail on Alipay. If Alipay matters, either sell Chinese customers monthly only,
+  or keep annual renewals under the cap.
+- Alipay only appears when the customer's address is in China **and** the
+  checkout is in CNY. `PADDLE_CURRENCY` sets the base currency plans are created
+  in; Paddle converts for the buyer.
+
+### I. API reference — billing
 
 | Method | Path | Auth | Purpose |
 | --- | --- | --- | --- |
 | `GET` | `/api/public/plans` | none | Live pricing catalog |
 | `GET` | `/api/public/username-available?username=` | none | Subdomain availability |
-| `POST` | `/api/public/register` | none | Self-serve signup, returns `checkoutUrl` |
-| `POST` | `/api/public/resume-checkout` | none | Re-open checkout for a `pending` factory |
-| `GET` | `/api/public/checkout-session?session_id=` | none | Confirm a completed checkout |
-| `POST` | `/api/billing/webhook` | Stripe signature | Subscription events (raw body) |
+| `POST` | `/api/public/register` | none | Self-serve signup, returns `transactionId` |
+| `POST` | `/api/public/resume-checkout` | none | New transaction for a `pending` factory |
+| `GET` | `/api/public/checkout-session?transaction_id=` | none | Confirm a completed checkout (also accepts `_ptxn`) |
+| `POST` | `/api/billing/webhook` | Paddle signature | Subscription events (raw body) |
 | `GET` | `/api/billing` | Factory | Plan, usage, channels, invoices |
-| `POST` | `/api/billing/checkout` | Factory | Change plan, or open Checkout |
-| `POST` | `/api/billing/portal` | Factory | Stripe billing portal URL |
+| `POST` | `/api/billing/checkout` | Factory | Change plan, or open a transaction |
+| `POST` | `/api/billing/portal` | Factory | Paddle customer portal URL |
 | `POST` | `/api/billing/cancel` | Factory | Set/clear cancel-at-period-end |
+| `GET` | `/api/billing/invoices/:id/pdf` | Factory | Short-lived invoice PDF link |
 | `GET` / `PATCH` | `/api/billing/channels[/:channel]` | Factory | List / toggle channels |
 | `GET` / `POST` | `/api/admin/plans` | Admin | List / create plans |
 | `PATCH` / `DELETE` | `/api/admin/plans/:code` | Admin | Edit / delete a plan |
-| `POST` | `/api/admin/plans/:code/sync` | Admin | Re-sync a plan to Stripe |
+| `POST` | `/api/admin/plans/:code/sync` | Admin | Re-sync a plan to Paddle |
 | `PATCH` | `/api/admin/factories/:id/plan` | Admin | Move a factory onto a plan |
 | `PATCH` | `/api/admin/factories/:id/status` | Admin | Change a factory's status |
 
-`POST /api/admin/factories` now **requires** a `plan`, and accepts an optional
+`POST /api/admin/factories` **requires** a `plan` and accepts an optional
 `interval`. No payment is taken; the plan is what sets the account's limits.
 
 > Deleting a plan is refused while any factory is on it (**409 `PLAN_IN_USE`**).
 > Deactivate it instead: it disappears from pricing while subscribers keep working.
 >
-> Admin plan changes bypass Stripe — right for a comp or a correction, wrong for
+> Admin plan changes bypass Paddle — right for a comp or a correction, wrong for
 > a real upgrade. Customers change their own plan from the billing page, which
-> does go through Stripe and prorates.
+> does go through Paddle and prorates.

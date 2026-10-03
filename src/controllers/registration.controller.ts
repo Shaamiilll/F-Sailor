@@ -1,6 +1,6 @@
 import { Request, Response } from "express";
 import { isBillingInterval } from "../config/plans";
-import { BillingDisabledError } from "../config/stripe";
+import { BillingDisabledError } from "../config/paddle";
 import * as planService from "../services/plan.service";
 import * as registration from "../services/registration.service";
 
@@ -100,7 +100,7 @@ function respondWithError(res: Response, err: Error) {
     return;
   }
   if (err instanceof BillingDisabledError) {
-    res.status(503).json({ error: err.message, code: err.code });
+    res.status(503).json({ error: err.message, code: "BILLING_DISABLED" });
     return;
   }
   console.error("[register]", err);

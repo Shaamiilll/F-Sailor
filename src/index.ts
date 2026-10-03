@@ -26,7 +26,7 @@ app.use(
   })
 );
 
-// Stripe's webhook must see the exact bytes Stripe signed, so it is mounted
+// Paddle's webhook must see the exact bytes Paddle signed, so it is mounted
 // with a raw body parser BEFORE express.json() -- parsing and reserializing the
 // JSON changes the payload and the signature check then fails.
 app.post(

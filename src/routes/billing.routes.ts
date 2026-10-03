@@ -16,6 +16,7 @@ router.get("/", billingController.overview);
 router.post("/checkout", billingController.checkout);
 router.post("/portal", billingController.portal);
 router.post("/cancel", billingController.setCancelAtPeriodEnd);
+router.get("/invoices/:id/pdf", billingController.invoicePdf);
 
 router.get("/channels", billingController.listChannels);
 router.patch("/channels/:channel", billingController.setChannel);

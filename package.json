@@ -9,10 +9,12 @@
     "db:init": "tsx src/db/init.ts",
     "db:migrate": "tsx src/db/migrate-commerce.ts",
     "db:migrate:billing": "tsx src/db/migrate-billing.ts",
-    "stripe:sync": "tsx src/scripts/stripe-sync.ts"
+    "db:migrate:paddle": "tsx src/db/migrate-paddle.ts",
+    "paddle:sync": "tsx src/scripts/paddle-sync.ts"
   },
   "dependencies": {
     "@google/genai": "^2.21.0",
+    "@paddle/paddle-node-sdk": "^3.10.0",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
@@ -20,8 +22,7 @@
     "jsonwebtoken": "^9.0.2",
     "pdfkit": "^0.20.2",
     "pg": "^8.13.1",
-    "sharp": "^0.35.4",
-    "stripe": "^23.0.0"
+    "sharp": "^0.35.4"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",

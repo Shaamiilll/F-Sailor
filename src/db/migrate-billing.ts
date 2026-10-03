@@ -13,17 +13,17 @@ import { DEFAULT_PLANS } from "../config/plans";
  *   pending   -- signed up, subdomain reserved, has NOT paid yet. Cannot use
  *                the dashboard; the login response sends them to checkout.
  *   active    -- paid (or admin-provisioned). Full access.
- *   past_due  -- Stripe failed to collect. Still allowed in, shown a banner, so
+ *   past_due  -- payment failed. Still allowed in, shown a banner, so
  *                a lapsed card doesn't lock a factory out of its own data.
  *   canceled  -- subscription ended. Data is kept, access is not.
  *   suspended -- switched off by an admin.
  *
  * `provisioned_by` separates the two creation paths. An 'admin' factory has no
- * Stripe subscription by design and is never chased for payment.
+ * payment-provider subscription by design and is never chased for payment.
  */
 export const billingSchema = `
--- The price list. Stripe ids live here rather than in the environment because
--- an admin can create a plan at runtime, which then has to be pushed to Stripe.
+-- The price list. Provider ids live here rather than in the environment because
+-- an admin can create a plan at runtime, which then has to be pushed to Paddle.
 CREATE TABLE IF NOT EXISTS plans (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   code VARCHAR(40) NOT NULL UNIQUE,
@@ -40,29 +40,29 @@ CREATE TABLE IF NOT EXISTS plans (
   popular BOOLEAN NOT NULL DEFAULT FALSE,
   sort_order INTEGER NOT NULL DEFAULT 0,
   active BOOLEAN NOT NULL DEFAULT TRUE,
-  stripe_product_id VARCHAR(255),
-  stripe_monthly_price_id VARCHAR(255),
-  stripe_annual_price_id VARCHAR(255),
+  paddle_product_id VARCHAR(255),
+  paddle_monthly_price_id VARCHAR(255),
+  paddle_annual_price_id VARCHAR(255),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_plans_active ON plans(active, sort_order);
-CREATE INDEX IF NOT EXISTS idx_plans_monthly_price_id ON plans(stripe_monthly_price_id);
-CREATE INDEX IF NOT EXISTS idx_plans_annual_price_id ON plans(stripe_annual_price_id);
+CREATE INDEX IF NOT EXISTS idx_plans_paddle_monthly ON plans(paddle_monthly_price_id);
+CREATE INDEX IF NOT EXISTS idx_plans_paddle_annual ON plans(paddle_annual_price_id);
 
 ALTER TABLE factories ADD COLUMN IF NOT EXISTS plan VARCHAR(40) NOT NULL DEFAULT 'starter';
 ALTER TABLE factories ADD COLUMN IF NOT EXISTS billing_interval VARCHAR(10) NOT NULL DEFAULT 'monthly';
 ALTER TABLE factories ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active';
 ALTER TABLE factories ADD COLUMN IF NOT EXISTS provisioned_by VARCHAR(20) NOT NULL DEFAULT 'admin';
 ALTER TABLE factories ADD COLUMN IF NOT EXISTS channel_limit INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE factories ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(255);
-ALTER TABLE factories ADD COLUMN IF NOT EXISTS stripe_subscription_id VARCHAR(255);
+ALTER TABLE factories ADD COLUMN IF NOT EXISTS paddle_customer_id VARCHAR(255);
+ALTER TABLE factories ADD COLUMN IF NOT EXISTS paddle_subscription_id VARCHAR(255);
 ALTER TABLE factories ADD COLUMN IF NOT EXISTS current_period_end TIMESTAMPTZ;
 ALTER TABLE factories ADD COLUMN IF NOT EXISTS cancel_at_period_end BOOLEAN NOT NULL DEFAULT FALSE;
 
-CREATE INDEX IF NOT EXISTS idx_factories_stripe_customer ON factories(stripe_customer_id);
-CREATE INDEX IF NOT EXISTS idx_factories_stripe_subscription ON factories(stripe_subscription_id);
+CREATE INDEX IF NOT EXISTS idx_factories_paddle_customer ON factories(paddle_customer_id);
+CREATE INDEX IF NOT EXISTS idx_factories_paddle_subscription ON factories(paddle_subscription_id);
 CREATE INDEX IF NOT EXISTS idx_factories_status ON factories(status);
 CREATE INDEX IF NOT EXISTS idx_factories_plan ON factories(plan);
 
@@ -81,11 +81,11 @@ CREATE TABLE IF NOT EXISTS factory_channels (
 
 CREATE INDEX IF NOT EXISTS idx_factory_channels_factory ON factory_channels(factory_id);
 
--- Stripe delivers webhooks at least once and retries on any non-2xx. Recording
--- each event id makes a replay a no-op instead of a repeated plan change.
+-- Paddle delivers webhooks at least once and retries on failure. Recording each
+-- event id makes a replay a no-op instead of a repeated plan change.
 CREATE TABLE IF NOT EXISTS subscription_events (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  stripe_event_id VARCHAR(255) NOT NULL UNIQUE,
+  provider_event_id VARCHAR(255) NOT NULL UNIQUE,
   type VARCHAR(100) NOT NULL,
   factory_id UUID REFERENCES factories(id) ON DELETE SET NULL,
   payload JSONB,

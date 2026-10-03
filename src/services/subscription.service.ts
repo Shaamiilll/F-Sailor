@@ -45,8 +45,8 @@ export interface FactorySubscription {
   provisionedBy: ProvisionedBy;
   channelLimit: number;
   monthlyMockupLimit: number;
-  stripeCustomerId: string | null;
-  stripeSubscriptionId: string | null;
+  paddleCustomerId: string | null;
+  paddleSubscriptionId: string | null;
   currentPeriodEnd: Date | null;
   cancelAtPeriodEnd: boolean;
 }
@@ -71,8 +71,8 @@ export function mapSubscription(row: Record<string, any>): FactorySubscription {
     provisionedBy: (row.provisioned_by ?? "admin") as ProvisionedBy,
     channelLimit: Number(row.channel_limit ?? 1),
     monthlyMockupLimit: Number(row.monthly_mockup_limit ?? 200),
-    stripeCustomerId: row.stripe_customer_id ?? null,
-    stripeSubscriptionId: row.stripe_subscription_id ?? null,
+    paddleCustomerId: row.paddle_customer_id ?? null,
+    paddleSubscriptionId: row.paddle_subscription_id ?? null,
     currentPeriodEnd: row.current_period_end ?? null,
     cancelAtPeriodEnd: Boolean(row.cancel_at_period_end),
   };
@@ -85,21 +85,21 @@ export async function getSubscription(
   return result.rows[0] ? mapSubscription(result.rows[0]) : null;
 }
 
-export async function findByStripeCustomer(
+export async function findByPaddleCustomer(
   customerId: string
 ): Promise<FactorySubscription | null> {
   const result = await pool.query(
-    "SELECT * FROM factories WHERE stripe_customer_id = $1",
+    "SELECT * FROM factories WHERE paddle_customer_id = $1",
     [customerId]
   );
   return result.rows[0] ? mapSubscription(result.rows[0]) : null;
 }
 
-export async function findByStripeSubscription(
+export async function findByPaddleSubscription(
   subscriptionId: string
 ): Promise<FactorySubscription | null> {
   const result = await pool.query(
-    "SELECT * FROM factories WHERE stripe_subscription_id = $1",
+    "SELECT * FROM factories WHERE paddle_subscription_id = $1",
     [subscriptionId]
   );
   return result.rows[0] ? mapSubscription(result.rows[0]) : null;
@@ -115,8 +115,8 @@ export async function applyPlan(
   interval: BillingInterval,
   extra: {
     status?: FactoryStatus;
-    stripeCustomerId?: string | null;
-    stripeSubscriptionId?: string | null;
+    paddleCustomerId?: string | null;
+    paddleSubscriptionId?: string | null;
     currentPeriodEnd?: Date | null;
     cancelAtPeriodEnd?: boolean;
   } = {}
@@ -130,8 +130,8 @@ export async function applyPlan(
        channel_limit = $4,
        monthly_mockup_limit = $5,
        status = COALESCE($6, status),
-       stripe_customer_id = COALESCE($7, stripe_customer_id),
-       stripe_subscription_id = COALESCE($8, stripe_subscription_id),
+       paddle_customer_id = COALESCE($7, paddle_customer_id),
+       paddle_subscription_id = COALESCE($8, paddle_subscription_id),
        current_period_end = COALESCE($9, current_period_end),
        cancel_at_period_end = COALESCE($10, cancel_at_period_end)
      WHERE id = $1
@@ -143,8 +143,8 @@ export async function applyPlan(
       plan.channelLimit,
       plan.monthlyMockupLimit,
       extra.status ?? null,
-      extra.stripeCustomerId ?? null,
-      extra.stripeSubscriptionId ?? null,
+      extra.paddleCustomerId ?? null,
+      extra.paddleSubscriptionId ?? null,
       extra.currentPeriodEnd ?? null,
       extra.cancelAtPeriodEnd ?? null,
     ]
@@ -167,11 +167,11 @@ export async function setStatus(
   await pool.query("UPDATE factories SET status = $2 WHERE id = $1", [factoryId, status]);
 }
 
-export async function setStripeCustomer(
+export async function setPaddleCustomer(
   factoryId: string,
   customerId: string
 ): Promise<void> {
-  await pool.query("UPDATE factories SET stripe_customer_id = $2 WHERE id = $1", [
+  await pool.query("UPDATE factories SET paddle_customer_id = $2 WHERE id = $1", [
     factoryId,
     customerId,
   ]);

@@ -3,7 +3,7 @@ import { AuthRequest } from "../middleware/auth.middleware";
 import * as planService from "../services/plan.service";
 
 /**
- * Admin-side CRUD for the price list. Every write syncs the plan into Stripe so
+ * Admin-side CRUD for the price list. Every write syncs the plan into Paddle so
  * the catalog and the payment processor stay in step without a deploy.
  */
 
@@ -50,11 +50,11 @@ export async function remove(req: AuthRequest, res: Response) {
   }
 }
 
-/** Re-pushes a plan into Stripe, for when an earlier sync failed. */
+/** Re-pushes a plan into Paddle, for when an earlier sync failed. */
 export async function sync(req: AuthRequest, res: Response) {
   try {
     const plan = await planService.requirePlan(String(req.params.code));
-    res.json(await planService.syncPlanToStripe(plan));
+    res.json(await planService.syncPlanToPaddle(plan));
   } catch (err) {
     fail(res, err as Error);
   }

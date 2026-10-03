@@ -3,6 +3,7 @@ import { pool } from "../config/db";
 import { env } from "../config/env";
 import { commerceSchema } from "./migrate-commerce";
 import { billingSchema, seedPlans } from "./migrate-billing";
+import { paddleRenameSchema } from "./migrate-paddle";
 
 const schema = `
 CREATE TABLE IF NOT EXISTS factories (
@@ -164,6 +165,9 @@ async function init() {
     // Quotation items, orders, customer logins and document numbering.
     await client.query(commerceSchema);
     // Subscription plans, factory status, channels and webhook bookkeeping.
+    // The rename runs first so an older Stripe-era database is carried over
+    // rather than ending up with two empty sets of columns.
+    await client.query(paddleRenameSchema);
     await client.query(billingSchema);
     await seedPlans(client);
 

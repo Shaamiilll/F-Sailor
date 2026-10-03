@@ -36,9 +36,9 @@ export interface PlanInput {
 
 export interface Plan extends PlanInput {
   id: string;
-  stripeProductId: string | null;
-  stripeMonthlyPriceId: string | null;
-  stripeAnnualPriceId: string | null;
+  paddleProductId: string | null;
+  paddleMonthlyPriceId: string | null;
+  paddleAnnualPriceId: string | null;
   createdAt: Date;
   updatedAt: Date;
 }

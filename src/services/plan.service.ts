@@ -1,5 +1,12 @@
 import { pool } from "../config/db";
-import { BillingDisabledError, billingEnabled, stripe } from "../config/stripe";
+import { env } from "../config/env";
+import {
+  BillingDisabledError,
+  billingEnabled,
+  isMissingResource,
+  paddle,
+  toMinorUnits,
+} from "../config/paddle";
 import {
   BillingInterval,
   Plan,
@@ -12,14 +19,13 @@ import {
  *
  * Plans are rows an admin creates and edits, so everything downstream -- what a
  * tier costs, how many channels it unlocks, how many mockups it allows -- is
- * read from here rather than from a constant. Each plan also carries the Stripe
- * product and price ids that back it, created on demand by `syncPlanToStripe`.
+ * read from here rather than from a constant. Each plan also carries the Paddle
+ * product and price ids that back it, created on demand by `syncPlanToPaddle`.
  *
- * Stripe prices are immutable. Changing a plan's amount therefore creates a
- * *new* price and archives the old one; subscriptions already on the old price
- * keep paying it until they're moved, which is the behaviour you want -- an
- * admin editing the public price list shouldn't silently re-bill existing
- * customers.
+ * Unlike Stripe, Paddle prices are mutable, so an edit updates the existing
+ * price in place. Paddle keeps billing current subscribers at the amount they
+ * signed up for until their subscription is explicitly changed, so editing the
+ * public price list still never silently re-bills an existing customer.
  */
 
 export class PlanNotFoundError extends Error {
@@ -63,9 +69,9 @@ function mapPlan(row: Record<string, any>): Plan {
     popular: Boolean(row.popular),
     sortOrder: Number(row.sort_order ?? 0),
     active: Boolean(row.active),
-    stripeProductId: row.stripe_product_id ?? null,
-    stripeMonthlyPriceId: row.stripe_monthly_price_id ?? null,
-    stripeAnnualPriceId: row.stripe_annual_price_id ?? null,
+    paddleProductId: row.paddle_product_id ?? null,
+    paddleMonthlyPriceId: row.paddle_monthly_price_id ?? null,
+    paddleAnnualPriceId: row.paddle_annual_price_id ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -92,7 +98,7 @@ export async function requirePlan(code: string): Promise<Plan> {
   return plan;
 }
 
-/** The shape the marketing site and signup form read. No Stripe ids. */
+/** The shape the marketing site and signup form read. No Paddle ids. */
 export function toPublicPlan(plan: Plan) {
   return {
     code: plan.code,
@@ -224,10 +230,10 @@ export async function createPlan(body: Record<string, any>): Promise<Plan> {
   );
 
   const plan = mapPlan(result.rows[0]);
-  return syncPlanToStripe(plan).catch((err) => {
-    // A Stripe hiccup shouldn't lose the admin's work. The plan exists and can
+  return syncPlanToPaddle(plan).catch((err) => {
+    // A Paddle hiccup shouldn't lose the admin's work. The plan exists and can
     // be re-synced; only checkout for this plan is unavailable until it is.
-    console.error(`[plans] Stripe sync failed for "${plan.code}":`, err);
+    console.error(`[plans] Paddle sync failed for "${plan.code}":`, err);
     return plan;
   });
 }
@@ -288,8 +294,8 @@ export async function updatePlan(code: string, body: Record<string, any>): Promi
     [plan.code, plan.channelLimit]
   );
 
-  return syncPlanToStripe(plan).catch((err) => {
-    console.error(`[plans] Stripe sync failed for "${plan.code}":`, err);
+  return syncPlanToPaddle(plan).catch((err) => {
+    console.error(`[plans] Paddle sync failed for "${plan.code}":`, err);
     return plan;
   });
 }
@@ -314,44 +320,59 @@ export async function deletePlan(code: string): Promise<void> {
     );
   }
 
-  if (plan.stripeProductId && billingEnabled) {
-    await stripe()
-      .products.update(plan.stripeProductId, { active: false })
-      .catch((err) => console.error(`[plans] Could not archive Stripe product:`, err));
+  if (plan.paddleProductId && billingEnabled) {
+    await paddle()
+      .products.archive(plan.paddleProductId)
+      .catch((err) => console.error("[plans] Could not archive Paddle product:", err));
   }
 
   await pool.query("DELETE FROM plans WHERE code = $1", [plan.code]);
 }
 
-// --- Stripe sync -------------------------------------------------------------
+// --- Paddle sync -------------------------------------------------------------
 
 /**
- * Makes Stripe match the row: creates the product if missing, and creates a new
- * price whenever the amount has changed (Stripe prices can't be edited). The
- * resulting ids are written back onto the plan.
+ * Makes Paddle match the row: creates the product and its two prices if they
+ * don't exist, and updates them in place when they do.
  *
- * A plan priced at 0 for an interval gets no price for that interval -- that's
- * how an admin offers, say, monthly-only billing.
+ * A plan priced at 0 for an interval gets no price for that interval -- that is
+ * how an admin offers, say, monthly-only billing. An existing price is archived
+ * in that case so checkout cannot reach it.
  */
-export async function syncPlanToStripe(plan: Plan): Promise<Plan> {
+export async function syncPlanToPaddle(plan: Plan): Promise<Plan> {
   if (!billingEnabled) return plan;
 
-  const client = stripe();
-  let productId = plan.stripeProductId;
+  const client = paddle();
+  let productId = plan.paddleProductId;
 
   if (productId) {
-    await client.products.update(productId, {
-      name: `${plan.tier} — ${plan.name}`,
-      description: plan.tagline || undefined,
-      active: plan.active,
-      metadata: { plan_code: plan.code },
-    });
-  } else {
+    // A stored id can belong to a different Paddle account or environment --
+    // switching between sandbox and production leaves every id here pointing at
+    // something that does not exist. Treat that as "not synced yet" and make a
+    // fresh product, rather than failing and leaving the plan unsellable.
+    try {
+      await client.products.update(productId, {
+        name: plan.tier + " \u2014 " + plan.name,
+        description: plan.tagline || null,
+        customData: { plan_code: plan.code },
+      });
+    } catch (err) {
+      if (!isMissingResource(err)) throw err;
+      console.warn(
+        `[plans] Paddle product ${productId} for "${plan.code}" is not in this account/environment -- recreating.`
+      );
+      productId = null;
+    }
+  }
+
+  if (!productId) {
     const product = await client.products.create({
-      name: `${plan.tier} — ${plan.name}`,
-      description: plan.tagline || undefined,
-      active: plan.active,
-      metadata: { plan_code: plan.code },
+      name: plan.tier + " \u2014 " + plan.name,
+      // "standard" covers SaaS. Paddle uses this to work out tax treatment, and
+      // the categories beyond "standard" need approval on your account first.
+      taxCategory: "standard",
+      description: plan.tagline || null,
+      customData: { plan_code: plan.code },
     });
     productId = product.id;
   }
@@ -360,20 +381,20 @@ export async function syncPlanToStripe(plan: Plan): Promise<Plan> {
     productId,
     plan,
     "monthly",
-    plan.stripeMonthlyPriceId
+    plan.paddleMonthlyPriceId
   );
   const annualPriceId = await ensurePrice(
     productId,
     plan,
     "annual",
-    plan.stripeAnnualPriceId
+    plan.paddleAnnualPriceId
   );
 
   const result = await pool.query(
     `UPDATE plans SET
-       stripe_product_id = $2,
-       stripe_monthly_price_id = $3,
-       stripe_annual_price_id = $4,
+       paddle_product_id = $2,
+       paddle_monthly_price_id = $3,
+       paddle_annual_price_id = $4,
        updated_at = NOW()
      WHERE code = $1
      RETURNING *`,
@@ -389,76 +410,79 @@ async function ensurePrice(
   interval: BillingInterval,
   currentPriceId: string | null
 ): Promise<string | null> {
-  const client = stripe();
-  const amount = Math.round(priceForInterval(plan, interval) * 100);
-  const stripeInterval = interval === "annual" ? "year" : "month";
+  const client = paddle();
+  const amount = priceForInterval(plan, interval);
+  const paddleInterval = interval === "annual" ? "year" : "month";
 
   if (amount <= 0) {
-    // Price removed: archive whatever was there so checkout can't reach it.
+    // Price removed: archive whatever was there so checkout cannot reach it.
     if (currentPriceId) {
-      await client.prices
-        .update(currentPriceId, { active: false })
-        .catch(() => undefined);
+      await client.prices.archive(currentPriceId).catch(() => undefined);
     }
     return null;
   }
 
+  const unitPrice = {
+    amount: toMinorUnits(amount),
+    currencyCode: env.paddle.currency as "USD",
+  };
+  const description =
+    plan.tier + " \u2014 " + (interval === "annual" ? "Annual" : "Monthly");
+
   if (currentPriceId) {
-    const current = await client.prices.retrieve(currentPriceId).catch(() => null);
-    if (
-      current &&
-      current.active &&
-      current.unit_amount === amount &&
-      current.recurring?.interval === stripeInterval
-    ) {
-      return current.id;
+    try {
+      // Paddle prices are mutable, so an amount change is an update rather than
+      // the create-and-archive dance Stripe forces.
+      const updated = await client.prices.update(currentPriceId, {
+        description,
+        unitPrice,
+        customData: { plan_code: plan.code, interval },
+      });
+      return updated.id;
+    } catch (err) {
+      if (!isMissingResource(err)) throw err;
+      // Belongs to another account/environment -- fall through and recreate.
     }
   }
 
   const created = await client.prices.create({
-    product: productId,
-    currency: "usd",
-    unit_amount: amount,
-    recurring: { interval: stripeInterval },
-    metadata: { plan_code: plan.code, interval },
+    productId,
+    description,
+    unitPrice,
+    billingCycle: { interval: paddleInterval, frequency: 1 },
+    customData: { plan_code: plan.code, interval },
   });
-
-  // Archive the superseded price. Existing subscriptions on it are unaffected;
-  // it simply can't be used for new checkouts.
-  if (currentPriceId && currentPriceId !== created.id) {
-    await client.prices.update(currentPriceId, { active: false }).catch(() => undefined);
-  }
 
   return created.id;
 }
 
-/** Pushes every plan into Stripe. Backs `npm run stripe:sync`. */
-export async function syncAllPlansToStripe(): Promise<Plan[]> {
+/** Pushes every plan into Paddle. Backs `npm run paddle:sync`. */
+export async function syncAllPlansToPaddle(): Promise<Plan[]> {
   const plans = await listPlans();
   const synced: Plan[] = [];
   for (const plan of plans) {
-    synced.push(await syncPlanToStripe(plan));
+    synced.push(await syncPlanToPaddle(plan));
   }
   return synced;
 }
 
 /**
- * The Stripe price id to charge for a plan/interval, creating it on the fly if
+ * The Paddle price id to charge for a plan/interval, creating it on the fly if
  * the plan has never been synced.
  */
-export async function stripePriceIdFor(
+export async function paddlePriceIdFor(
   planCode: string,
   interval: BillingInterval
 ): Promise<string> {
-  // Without keys a sync is a no-op, which would otherwise surface here as the
+  // Without a key a sync is a no-op, which would otherwise surface here as the
   // misleading "this plan has no price" rather than "billing isn't set up".
   if (!billingEnabled) throw new BillingDisabledError();
 
   let plan = await requirePlan(planCode);
 
-  const field = interval === "annual" ? "stripeAnnualPriceId" : "stripeMonthlyPriceId";
+  const field = interval === "annual" ? "paddleAnnualPriceId" : "paddleMonthlyPriceId";
   if (!plan[field]) {
-    plan = await syncPlanToStripe(plan);
+    plan = await syncPlanToPaddle(plan);
   }
 
   const priceId = plan[field];
@@ -471,12 +495,12 @@ export async function stripePriceIdFor(
 }
 
 /** Reverse lookup used by the webhook to tell which plan a subscription is on. */
-export async function findPlanByStripePriceId(
+export async function findPlanByPaddlePriceId(
   priceId: string
 ): Promise<{ plan: Plan; interval: BillingInterval } | null> {
   const result = await pool.query(
     `SELECT * FROM plans
-      WHERE stripe_monthly_price_id = $1 OR stripe_annual_price_id = $1
+      WHERE paddle_monthly_price_id = $1 OR paddle_annual_price_id = $1
       LIMIT 1`,
     [priceId]
   );
@@ -485,6 +509,6 @@ export async function findPlanByStripePriceId(
   const plan = mapPlan(result.rows[0]);
   return {
     plan,
-    interval: plan.stripeAnnualPriceId === priceId ? "annual" : "monthly",
+    interval: plan.paddleAnnualPriceId === priceId ? "annual" : "monthly",
   };
 }
